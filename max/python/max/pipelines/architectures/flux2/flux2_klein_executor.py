@@ -527,13 +527,30 @@ class Flux2KleinExecutor(
                 inputs.negative_tokens, inputs.negative_attention_bias
             )
 
+        # The latents carry the ``num_images`` batch; the text encoder runs
+        # once per (single) prompt, so replicate the prompt embeddings up to
+        # the latent batch. All other transformer inputs (latent ids, text
+        # ids, guidance) are already built at ``num_images`` by
+        # ``prepare_inputs``; only the embeddings and the empty image
+        # placeholders (and, per step, the timestep) need lining up.
+        num_images = int(inputs.latents.shape[0])
+        prompt_embeds = self._broadcast_batch(prompt_embeds, num_images)
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = self._broadcast_batch(
+                negative_prompt_embeds, num_images
+            )
+
         if inputs.input_image is not None:
             image_latents, image_latent_ids = self.image_encoder(
                 inputs.input_image
             )
+            image_latents = self._broadcast_batch(image_latents, num_images)
+            image_latent_ids = self._broadcast_batch(
+                image_latent_ids, num_images
+            )
         else:
-            image_latents = self._empty_image_latents()
-            image_latent_ids = self._empty_image_latent_ids()
+            image_latents = self._empty_image_latents(num_images)
+            image_latent_ids = self._empty_image_latent_ids(num_images)
 
         latents = self._run_denoising_loop(
             latents=inputs.latents,
@@ -579,6 +596,7 @@ class Flux2KleinExecutor(
         do_cfg: bool,
     ) -> Buffer:
         num_steps: int = np.from_dlpack(num_inference_steps).item()  # type: ignore[assignment]
+        num_images = int(latents.shape[0])
 
         state_pos: TaylorSeerBufferState | None = None
         state_neg: TaylorSeerBufferState | None = None
@@ -593,7 +611,10 @@ class Flux2KleinExecutor(
                 )
 
         for i in range(num_steps):
-            timestep_i = timesteps[i : i + 1]
+            # timestep is shape [batch] to the transformer; broadcast the
+            # per-step scalar to num_images. dt stays a scalar [1] (it
+            # broadcasts across the whole tensor in the Euler step).
+            timestep_i = self._broadcast_batch(timesteps[i : i + 1], num_images)
             dt_i = dts[i : i + 1]
 
             noise_pred = self._stream_noise_pred(
@@ -713,19 +734,51 @@ class Flux2KleinExecutor(
             arr, dtype=self._model_dtype, device=self._model_device
         )
 
-    def _empty_image_latents(self) -> Buffer:
-        """Zero-seq image latent placeholder for text-to-image."""
+    def _empty_image_latents(self, num_images: int = 1) -> Buffer:
+        """Zero-seq image latent placeholder for text-to-image.
+
+        Batched to ``num_images`` so it concatenates with the ``num_images``
+        latents along the sequence axis without a batch mismatch.
+        """
         return float32_array_to_buffer(
-            np.zeros((1, 0, self._in_channels), dtype=np.float32),
+            np.zeros((num_images, 0, self._in_channels), dtype=np.float32),
             dtype=self._model_dtype,
             device=self._model_device,
         )
 
-    def _empty_image_latent_ids(self) -> Buffer:
+    def _empty_image_latent_ids(self, num_images: int = 1) -> Buffer:
         """Zero-seq image latent-ID placeholder for text-to-image."""
-        return Buffer.from_dlpack(np.zeros((1, 0, 4), dtype=np.int64)).to(
-            self._model_device
-        )
+        return Buffer.from_dlpack(
+            np.zeros((num_images, 0, 4), dtype=np.int64)
+        ).to(self._model_device)
+
+    @staticmethod
+    def _broadcast_batch(buf: Buffer, num_images: int) -> Buffer:
+        """Replicate a batch-1 tensor along dim 0 to ``num_images``.
+
+        Lines up single-prompt conditioning (prompt embeddings and the
+        per-step timestep) with the ``num_images`` latent batch so every
+        transformer input shares the same symbolic ``batch`` dim. A no-op
+        when ``num_images == 1``. Runs on the host (dlpack has no bf16, so
+        bf16 is reinterpreted as uint16); the embed copy happens at most
+        once per request and the timestep copy is a scalar.
+        """
+        if num_images == 1:
+            return buf
+        device = buf.device
+        if buf.dtype == DType.bfloat16:
+            arr = buf.view(DType.uint16).to_numpy()
+            arr = np.ascontiguousarray(
+                np.broadcast_to(arr, (num_images, *arr.shape[1:]))
+            )
+            out = Buffer.from_dlpack(arr).view(DType.bfloat16)
+        else:
+            arr = buf.to_numpy()
+            arr = np.ascontiguousarray(
+                np.broadcast_to(arr, (num_images, *arr.shape[1:]))
+            )
+            out = Buffer.from_dlpack(arr)
+        return out.to(device)
 
     def _prepare_scheduler(
         self,
