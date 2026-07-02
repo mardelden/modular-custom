@@ -20,7 +20,7 @@ without max.experimental dependencies.
 
 import math
 
-from max.driver import accelerator_api
+from max.driver import accelerator_api, accelerator_architecture_name
 from max.dtype import DType
 from max.graph import DeviceRef, TensorType, TensorValue, ops
 from max.nn.attention.mask_config import MHAMaskVariant
@@ -126,13 +126,28 @@ class ResnetBlock2D(Module):
         dispatches to SM100 (CUDA) or AMD 4-wave (MI355X) in-kernel
         residual paths.
         """
-        return (
+        if not (
             self.in_channels == self.out_channels
             and self.conv_shortcut is None
             and isinstance(self.conv2.device, DeviceRef)
             and self.conv2.device.is_gpu()
-            and accelerator_api() in ("cuda", "rocm", "hip")
-        )
+        ):
+            return False
+        # The `conv2d_residual_add` custom op only has correct in-kernel
+        # residual paths for SM100-class Blackwell (B200) and CDNA4 (MI355X,
+        # gfx950). On other CUDA/ROCm archs — notably sm_120 (RTX PRO 6000
+        # Blackwell) and CDNA3 — that kernel produces wrong output (the VAE
+        # decoder collapsed a valid latent to a flat grey image), so fall
+        # back to the standard conv2 + residual add. Matches the SM100 gate
+        # in max.nn.kernels._is_sm10x_gpu().
+        try:
+            arch = accelerator_architecture_name()
+        except Exception:
+            return False
+        api = accelerator_api()
+        is_sm100 = api == "cuda" and arch.startswith("sm_10")
+        is_cdna4 = api in ("rocm", "hip") and "gfx95" in arch
+        return is_sm100 or is_cdna4
 
     def __call__(
         self, x: TensorValue, temb: TensorValue | None = None
