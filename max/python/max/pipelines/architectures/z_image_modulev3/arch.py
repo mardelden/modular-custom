@@ -40,9 +40,11 @@ class ZImageArchConfig(ArchConfig):
         pipeline_config: PipelineConfig,
         model_config: MAXModelConfig | None = None,
     ) -> Self:
-        model_config = model_config or pipeline_config.model
-        if len(model_config.device_specs) != 1:
-            raise ValueError("Z-Image is only supported on a single device")
+        # Do not read ``pipeline_config.model`` here: diffusion pipelines have
+        # no single "main" model and that accessor raises "No main model
+        # configured". The single-device constraint is validated in
+        # ``ZImagePipeline.init_remaining_components`` (which has
+        # ``transformer.devices``). Mirrors ``Flux2ArchConfig.initialize``.
         return cls(pipeline_config=pipeline_config)
 
 
@@ -53,6 +55,7 @@ z_image_arch = SupportedArchitecture(
     supported_encodings={"bfloat16"},
     example_repo_ids=[
         "Tongyi-MAI/Z-Image",
+        "Tongyi-MAI/Z-Image-Turbo",
         "Zyphra/Z-Image",
     ],
     pipeline_model=ZImagePipeline,  # type: ignore[arg-type]

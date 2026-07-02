@@ -241,6 +241,9 @@ class ZImagePipeline(DiffusionPipeline):
     @traced(message="ZImagePipeline.init_remaining_components")
     def init_remaining_components(self) -> None:
         """Initialize derived attributes and compiled subgraphs."""
+        if len(self.transformer.devices) != 1:
+            raise ValueError("Z-Image is only supported on a single device")
+
         self.vae_scale_factor = (
             2 ** (len(self.vae.config.block_out_channels) - 1)
             if getattr(self, "vae", None)
@@ -756,7 +759,19 @@ class ZImagePipeline(DiffusionPipeline):
 
         latents = self._postprocess_latents(latents)
         decoded: Tensor = self.vae.decode(latents)
-        return self._to_numpy(decoded)
+        image = self._to_numpy(decoded)
+
+        # The responses image encoder requires uint8 [0, 255] in HWC per
+        # image (open_responses.InputImageContent.from_numpy). The VAE
+        # decode returns float in ~[-1, 1] as NCHW; denormalize, clamp,
+        # quantize to uint8, and move channels last to match the FLUX.2
+        # VAE output contract.
+        image = image / 2.0 + 0.5
+        np.clip(image, 0.0, 1.0, out=image)
+        image = (image * 255.0).round().astype(np.uint8)
+        if image.ndim == 4:
+            image = np.transpose(image, (0, 2, 3, 1))
+        return image
 
     def _postprocess_latents(self, latents: Tensor) -> Tensor:
         batch_size = latents.shape[0]
