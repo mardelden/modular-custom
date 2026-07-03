@@ -123,6 +123,12 @@ class PipelineExecutor(ABC, Generic[ContextT, InputsT, OutputsT]):
             batching, scheduling, and execution behavior.
     """
 
+    supports_dynamic_batching: bool = False
+    """Whether :meth:`prepare_inputs` can collate more than one context into a
+    single batched execution. When ``False`` (default) the scheduler must send
+    exactly one context per call. Executors that stack multiple compatible
+    contexts set this to ``True``."""
+
     @abstractmethod
     def __init__(
         self,
