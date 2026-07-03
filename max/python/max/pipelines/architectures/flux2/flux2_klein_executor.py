@@ -208,6 +208,11 @@ class Flux2KleinExecutor(
 ):
     """Flux2 Klein pipeline executor with classifier-free guidance."""
 
+    # prepare_inputs stacks multiple compatible contexts (same resolution,
+    # steps, num_images, sigma schedule) into one batched denoise loop, so
+    # the scheduler may dynamically batch requests. See MODULAR_PIXEL_MAX_BATCH_SIZE.
+    supports_dynamic_batching: bool = True
+
     default_num_inference_steps: int = 28
 
     _DEFAULT_VAE_SCALE_FACTOR: int = 8
@@ -364,123 +369,195 @@ class Flux2KleinExecutor(
         if cc.taylorseer_max_order is None:
             cc.taylorseer_max_order = self._DEFAULT_TAYLORSEER_MAX_ORDER
 
+    @staticmethod
+    def _tokens_1d(token_buffer: Any) -> npt.NDArray[np.int64]:
+        """Return a 1D ``(S,)`` token array from a (possibly 2D) buffer."""
+        arr = token_buffer.array
+        if arr.ndim == 2:
+            if arr.shape[0] != 1:
+                raise ValueError(
+                    "Flux2KleinExecutor expects batch_size=1 per prompt."
+                )
+            arr = arr[0]
+        return arr
+
     @traced(message="Flux2KleinExecutor.prepare_inputs")
     def prepare_inputs(
         self, contexts: list[PixelContext]
     ) -> Flux2KleinExecutorInputs:
-        if len(contexts) != 1:
-            raise ValueError(
-                "Flux2KleinExecutor currently supports batch_size=1. "
-                f"Got {len(contexts)} contexts."
-            )
-        context = contexts[0]
+        if not contexts:
+            raise ValueError("Flux2KleinExecutor requires at least one context")
+        ref = contexts[0]
 
-        if context.latents.size == 0:
-            raise ValueError(
-                "Flux2KleinExecutor requires non-empty latents in PixelContext"
-            )
-        if context.latent_image_ids.size == 0:
-            raise ValueError(
-                "Flux2KleinExecutor requires non-empty latent_image_ids "
-                "in PixelContext"
-            )
-        if context.sigmas.size == 0:
-            raise ValueError(
-                "Flux2KleinExecutor requires non-empty sigmas in PixelContext"
-            )
+        # Validate every context and (for batches) that they are compatible:
+        # a single batched denoise loop shares one graph shape and one sigma
+        # schedule, so resolution / steps / num_images / sigmas must match.
+        for context in contexts:
+            if context.latents.size == 0:
+                raise ValueError(
+                    "Flux2KleinExecutor requires non-empty latents in "
+                    "PixelContext"
+                )
+            if context.latent_image_ids.size == 0:
+                raise ValueError(
+                    "Flux2KleinExecutor requires non-empty latent_image_ids "
+                    "in PixelContext"
+                )
+            if context.sigmas.size == 0:
+                raise ValueError(
+                    "Flux2KleinExecutor requires non-empty sigmas in "
+                    "PixelContext"
+                )
+        if len(contexts) > 1:
+            for context in contexts[1:]:
+                if (
+                    context.height != ref.height
+                    or context.width != ref.width
+                    or context.num_inference_steps != ref.num_inference_steps
+                    or context.num_images_per_prompt
+                    != ref.num_images_per_prompt
+                    or context.input_image is not None
+                    or ref.input_image is not None
+                    or not np.array_equal(
+                        np.asarray(context.sigmas), np.asarray(ref.sigmas)
+                    )
+                ):
+                    raise ValueError(
+                        "Flux2KleinExecutor can only batch requests sharing "
+                        "resolution, steps, num_images and sigma schedule "
+                        "(text-to-image only)."
+                    )
 
-        latent_h = context.height // self._vae_scale_factor
-        latent_w = context.width // self._vae_scale_factor
+        latent_h = ref.height // self._vae_scale_factor
+        latent_w = ref.width // self._vae_scale_factor
         packed_h = latent_h // 2
         packed_w = latent_w // 2
         image_seq_len = packed_h * packed_w
 
-        tokens_np = context.tokens.array
-        if tokens_np.ndim == 2:
-            if tokens_np.shape[0] != 1:
-                raise ValueError(
-                    "Flux2KleinExecutor expects batch_size=1 for 2D tokens."
+        # Per-context gather. Positive prompts contribute one token row each;
+        # image-batched fields (latents, ids, guidance) carry num_images rows
+        # per context and are concatenated to the total batch.
+        token_rows: list[npt.NDArray[np.int64]] = []
+        bias_rows: list[npt.NDArray[np.float32]] = []
+        latents_np: list[npt.NDArray[np.float32]] = []
+        text_ids_np: list[npt.NDArray[np.int64]] = []
+        lids_np: list[npt.NDArray[np.float32]] = []
+        guidance_np: list[npt.NDArray[np.float32]] = []
+
+        neg_token_rows: list[npt.NDArray[np.int64]] = []
+        neg_bias_rows: list[npt.NDArray[np.float32]] = []
+        neg_text_ids_np: list[npt.NDArray[np.int64]] = []
+        cfg_flags: list[bool] = []
+
+        for context in contexts:
+            tok = self._tokens_1d(context.tokens)
+            token_rows.append(tok)
+            bias_rows.append(self._attention_bias_np(context.mask, tok))
+            latents_np.append(np.asarray(context.latents))
+            text_ids_np.append(np.asarray(context.text_ids))
+            lids_np.append(np.asarray(context.latent_image_ids))
+            guidance_np.append(
+                np.full(
+                    [context.num_images_per_prompt],
+                    context.guidance_scale,
+                    dtype=np.float32,
                 )
-            tokens_np = tokens_np[0]
-        tokens = Buffer.from_dlpack(tokens_np)
-        text_ids = Buffer.from_dlpack(context.text_ids)
-        attention_bias = self._build_attention_bias(context.mask, tokens_np)
-
-        latents = self._patchify_and_pack(context.latents)
-        latent_image_ids = Buffer.from_dlpack(context.latent_image_ids)
-        timesteps, dts = self._prepare_scheduler(context.sigmas)
-
-        guidance = Buffer.from_dlpack(
-            np.full(
-                [context.num_images_per_prompt],
-                context.guidance_scale,
-                dtype=np.float32,
             )
+
+            has_negative = context.negative_tokens is not None
+            want_cfg = context.guidance_scale > 1.0
+            if (
+                self._is_distilled
+                and want_cfg
+                and context.explicit_negative_prompt
+            ):
+                logger.warning(
+                    "Guidance scale %s is ignored for distilled Klein models.",
+                    context.guidance_scale,
+                )
+            ctx_cfg = has_negative and want_cfg and not self._is_distilled
+            cfg_flags.append(ctx_cfg)
+            if ctx_cfg:
+                assert context.negative_tokens is not None
+                ntok = self._tokens_1d(context.negative_tokens)
+                neg_token_rows.append(ntok)
+                neg_bias_rows.append(
+                    self._attention_bias_np(context.negative_mask, ntok)
+                )
+                neg_text_ids_np.append(np.asarray(context.negative_text_ids))
+            elif (
+                not has_negative
+                and want_cfg
+                and not self._is_distilled
+                and context.explicit_negative_prompt
+            ):
+                logger.warning(
+                    "CFG requested (guidance_scale=%s) but no negative prompt "
+                    "was supplied; running without CFG.",
+                    context.guidance_scale,
+                )
+
+        if any(cfg_flags) and not all(cfg_flags):
+            raise ValueError(
+                "Flux2KleinExecutor can only batch requests that all use CFG "
+                "or all skip it."
+            )
+        enable_cfg = all(cfg_flags) and len(cfg_flags) > 0
+
+        tokens = Buffer.from_dlpack(np.ascontiguousarray(np.stack(token_rows)))
+        attention_bias = Buffer.from_dlpack(
+            np.ascontiguousarray(np.concatenate(bias_rows, axis=0))
         )
+        text_ids = Buffer.from_dlpack(
+            np.ascontiguousarray(np.concatenate(text_ids_np, axis=0))
+        )
+        latents = self._patchify_and_pack(
+            np.ascontiguousarray(np.concatenate(latents_np, axis=0))
+        )
+        latent_image_ids = Buffer.from_dlpack(
+            np.ascontiguousarray(np.concatenate(lids_np, axis=0))
+        )
+        guidance = Buffer.from_dlpack(np.concatenate(guidance_np))
+        timesteps, dts = self._prepare_scheduler(ref.sigmas)
 
         h_carrier = Buffer.from_dlpack(np.empty(packed_h, dtype=np.float32))
         w_carrier = Buffer.from_dlpack(np.empty(packed_w, dtype=np.float32))
 
-        height = Buffer.from_dlpack(np.array([context.height], dtype=np.int64))
-        width = Buffer.from_dlpack(np.array([context.width], dtype=np.int64))
+        height = Buffer.from_dlpack(np.array([ref.height], dtype=np.int64))
+        width = Buffer.from_dlpack(np.array([ref.width], dtype=np.int64))
         num_inference_steps = Buffer.from_dlpack(
-            np.array([context.num_inference_steps], dtype=np.int64)
+            np.array([ref.num_inference_steps], dtype=np.int64)
         )
         num_images_per_prompt = Buffer.from_dlpack(
-            np.array([context.num_images_per_prompt], dtype=np.int64)
+            np.array([ref.num_images_per_prompt], dtype=np.int64)
         )
         image_seq_len_buf = Buffer.from_dlpack(
             np.array([image_seq_len], dtype=np.int64)
         )
 
         input_image: Buffer | None = None
-        if context.input_image is not None:
-            input_image = Buffer.from_dlpack(context.input_image)
+        if len(contexts) == 1 and ref.input_image is not None:
+            input_image = Buffer.from_dlpack(ref.input_image)
 
         negative_tokens: Buffer | None = None
         negative_text_ids: Buffer | None = None
         negative_attention_bias: Buffer | None = None
         guidance_scale_buf: Buffer | None = None
-
-        has_negative = context.negative_tokens is not None
-        want_cfg = context.guidance_scale > 1.0
-        if self._is_distilled and want_cfg and context.explicit_negative_prompt:
-            logger.warning(
-                "Guidance scale %s is ignored for distilled Klein models.",
-                context.guidance_scale,
-            )
-        enable_cfg = has_negative and want_cfg and not self._is_distilled
         if enable_cfg:
-            assert context.negative_tokens is not None
-            negative_tokens_np = context.negative_tokens.array
-            if negative_tokens_np.ndim == 2:
-                if negative_tokens_np.shape[0] != 1:
-                    raise ValueError(
-                        "Flux2KleinExecutor expects batch_size=1 for 2D "
-                        "negative tokens."
-                    )
-                negative_tokens_np = negative_tokens_np[0]
-            negative_tokens = Buffer.from_dlpack(negative_tokens_np)
-            if context.negative_text_ids.size > 0:
+            negative_tokens = Buffer.from_dlpack(
+                np.ascontiguousarray(np.stack(neg_token_rows))
+            )
+            negative_attention_bias = Buffer.from_dlpack(
+                np.ascontiguousarray(np.concatenate(neg_bias_rows, axis=0))
+            )
+            if all(a.size > 0 for a in neg_text_ids_np):
                 negative_text_ids = Buffer.from_dlpack(
-                    context.negative_text_ids
+                    np.ascontiguousarray(
+                        np.concatenate(neg_text_ids_np, axis=0)
+                    )
                 )
-            negative_attention_bias = self._build_attention_bias(
-                context.negative_mask, negative_tokens_np
-            )
             guidance_scale_buf = Buffer.from_dlpack(
-                np.array(context.guidance_scale, dtype=np.float32)
-            )
-        elif (
-            not has_negative
-            and want_cfg
-            and not self._is_distilled
-            and context.explicit_negative_prompt
-        ):
-            logger.warning(
-                "CFG requested (guidance_scale=%s) but no negative prompt "
-                "was supplied; running without CFG.",
-                context.guidance_scale,
+                np.array(ref.guidance_scale, dtype=np.float32)
             )
 
         return Flux2KleinExecutorInputs(
@@ -515,42 +592,42 @@ class Flux2KleinExecutor(
 
         do_cfg = inputs.guidance_scale is not None
 
-        prompt_embeds = self._encode_prompt(
-            inputs.tokens, inputs.attention_bias
+        # ``tokens`` holds one row per prompt (N prompts across the batched
+        # requests); ``latents`` holds the full transformer batch
+        # (N * num_images). The Qwen3 encoder is batch-1, so encode each
+        # prompt separately, broadcast each to its num_images, and concat to
+        # the full batch. For a single request this is one encode broadcast
+        # to num_images (unchanged behavior).
+        total_batch = int(inputs.latents.shape[0])
+        n_prompts = int(inputs.tokens.shape[0])
+        num_images = total_batch // n_prompts
+
+        prompt_embeds = self._encode_stacked(
+            inputs.tokens, inputs.attention_bias, n_prompts, num_images
         )
 
         negative_prompt_embeds: Buffer | None = None
         if do_cfg:
             assert inputs.negative_tokens is not None
             assert inputs.negative_attention_bias is not None
-            negative_prompt_embeds = self._encode_prompt(
-                inputs.negative_tokens, inputs.negative_attention_bias
-            )
-
-        # The latents carry the ``num_images`` batch; the text encoder runs
-        # once per (single) prompt, so replicate the prompt embeddings up to
-        # the latent batch. All other transformer inputs (latent ids, text
-        # ids, guidance) are already built at ``num_images`` by
-        # ``prepare_inputs``; only the embeddings and the empty image
-        # placeholders (and, per step, the timestep) need lining up.
-        num_images = int(inputs.latents.shape[0])
-        prompt_embeds = self._broadcast_batch(prompt_embeds, num_images)
-        if negative_prompt_embeds is not None:
-            negative_prompt_embeds = self._broadcast_batch(
-                negative_prompt_embeds, num_images
+            negative_prompt_embeds = self._encode_stacked(
+                inputs.negative_tokens,
+                inputs.negative_attention_bias,
+                n_prompts,
+                num_images,
             )
 
         if inputs.input_image is not None:
             image_latents, image_latent_ids = self.image_encoder(
                 inputs.input_image
             )
-            image_latents = self._broadcast_batch(image_latents, num_images)
+            image_latents = self._broadcast_batch(image_latents, total_batch)
             image_latent_ids = self._broadcast_batch(
-                image_latent_ids, num_images
+                image_latent_ids, total_batch
             )
         else:
-            image_latents = self._empty_image_latents(num_images)
-            image_latent_ids = self._empty_image_latent_ids(num_images)
+            image_latents = self._empty_image_latents(total_batch)
+            image_latent_ids = self._empty_image_latent_ids(total_batch)
 
         latents = self._run_denoising_loop(
             latents=inputs.latents,
@@ -596,7 +673,7 @@ class Flux2KleinExecutor(
         do_cfg: bool,
     ) -> Buffer:
         num_steps: int = np.from_dlpack(num_inference_steps).item()  # type: ignore[assignment]
-        num_images = int(latents.shape[0])
+        batch_size = int(latents.shape[0])
 
         state_pos: TaylorSeerBufferState | None = None
         state_neg: TaylorSeerBufferState | None = None
@@ -614,7 +691,7 @@ class Flux2KleinExecutor(
             # timestep is shape [batch] to the transformer; broadcast the
             # per-step scalar to num_images. dt stays a scalar [1] (it
             # broadcasts across the whole tensor in the Euler step).
-            timestep_i = self._broadcast_batch(timesteps[i : i + 1], num_images)
+            timestep_i = self._broadcast_batch(timesteps[i : i + 1], batch_size)
             dt_i = dts[i : i + 1]
 
             noise_pred = self._stream_noise_pred(
@@ -696,14 +773,14 @@ class Flux2KleinExecutor(
         return noise_pred
 
     @staticmethod
-    def _build_attention_bias(
+    def _attention_bias_np(
         mask: npt.NDArray[np.bool_] | None,
         tokens_np: npt.NDArray[np.int64],
-    ) -> Buffer:
-        """Build a causal + padding additive bias Buffer from an optional mask.
+    ) -> npt.NDArray[np.float32]:
+        """Build the causal + padding additive bias as a numpy array.
 
-        Reuses the same static helper as the V3 Klein path so positive
-        and negative prompts share bias semantics with the encoder.
+        Shape ``(1, 1, S, S)`` float32. Separated from :meth:`_build_attention_bias`
+        so multiple prompts' biases can be concatenated along the batch axis.
         """
         seq_len = int(tokens_np.shape[0])
         attention_mask_np = (
@@ -716,7 +793,21 @@ class Flux2KleinExecutor(
                 attention_mask_np, expected_seq_len=seq_len
             )
         )
-        return Buffer.from_dlpack(np.ascontiguousarray(bias_np))
+        return np.ascontiguousarray(bias_np)
+
+    @staticmethod
+    def _build_attention_bias(
+        mask: npt.NDArray[np.bool_] | None,
+        tokens_np: npt.NDArray[np.int64],
+    ) -> Buffer:
+        """Build a causal + padding additive bias Buffer from an optional mask.
+
+        Reuses the same static helper as the V3 Klein path so positive
+        and negative prompts share bias semantics with the encoder.
+        """
+        return Buffer.from_dlpack(
+            Flux2KleinExecutor._attention_bias_np(mask, tokens_np)
+        )
 
     def _patchify_and_pack(
         self,
@@ -779,6 +870,50 @@ class Flux2KleinExecutor(
             )
             out = Buffer.from_dlpack(arr)
         return out.to(device)
+
+    @staticmethod
+    def _concat_batch(buffers: list[Buffer]) -> Buffer:
+        """Concatenate buffers along the batch axis (axis 0), host-side.
+
+        Used to assemble per-prompt embeddings into the full batch. bf16 is
+        reinterpreted as uint16 (dlpack has no bf16). Once per request.
+        """
+        if len(buffers) == 1:
+            return buffers[0]
+        device = buffers[0].device
+        if buffers[0].dtype == DType.bfloat16:
+            arrs = [b.view(DType.uint16).to_numpy() for b in buffers]
+            out = np.ascontiguousarray(np.concatenate(arrs, axis=0))
+            return Buffer.from_dlpack(out).view(DType.bfloat16).to(device)
+        arrs = [b.to_numpy() for b in buffers]
+        out = np.ascontiguousarray(np.concatenate(arrs, axis=0))
+        return Buffer.from_dlpack(out).to(device)
+
+    @traced(message="Flux2KleinExecutor.encode_stacked")
+    def _encode_stacked(
+        self,
+        tokens: Buffer,
+        attention_bias: Buffer,
+        n_prompts: int,
+        num_images: int,
+    ) -> Buffer:
+        """Encode each of ``n_prompts`` prompt rows and concat to the batch.
+
+        ``tokens`` is ``(N, S)`` and ``attention_bias`` ``(N, 1, S, S)``.
+        The Qwen3 encoder is batch-1, so each row is encoded separately,
+        broadcast to its ``num_images``, and concatenated into
+        ``(N * num_images, S, D)``.
+        """
+        embeds: list[Buffer] = []
+        for i in range(n_prompts):
+            # Buffer slicing needs an index per axis. Give the encoder a 1D
+            # (S,) token row so its internal 2D-squeeze path is skipped, and
+            # a (1, 1, S, S) bias.
+            tok_i = tokens[i, :]
+            bias_i = attention_bias[i : i + 1, :, :, :]
+            pe = self._encode_prompt(tok_i, bias_i)
+            embeds.append(self._broadcast_batch(pe, num_images))
+        return self._concat_batch(embeds)
 
     def _prepare_scheduler(
         self,

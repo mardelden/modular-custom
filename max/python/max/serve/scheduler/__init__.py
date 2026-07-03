@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Hashable
 from typing import Any, cast
 
 _logger = logging.getLogger("max.pipelines")
@@ -85,10 +85,31 @@ def load_scheduler(
         pixel_pipeline = cast(PixelGenerationPipeline[Any], pipeline)
 
         def batch_constructor(
-            context: PixelContext,
+            contexts: list[PixelContext],
         ) -> PixelGenerationInputs[Any]:
-            """Convert a single PixelContext into PixelGenerationInputs."""
-            return PixelGenerationInputs(batch={context.request_id: context})
+            """Collate one or more PixelContexts into PixelGenerationInputs."""
+            return PixelGenerationInputs(
+                batch={context.request_id: context for context in contexts}
+            )
+
+        def batch_key(context: PixelContext) -> Hashable:
+            """Group requests that a single batched denoise loop can serve.
+
+            Requests batch only when resolution, steps, num_images, CFG
+            shape (negative prompt present + guidance>1) all match. Image-to-
+            image requests are always solo (unique key) since the batched
+            path is text-to-image only.
+            """
+            if getattr(context, "input_image", None) is not None:
+                return ("solo", context.request_id)
+            return (
+                context.height,
+                context.width,
+                context.num_inference_steps,
+                context.num_images_per_prompt,
+                context.negative_tokens is not None,
+                context.guidance_scale > 1.0,
+            )
 
         return OneShotScheduler[
             PixelContext, PixelGenerationInputs[Any], GenerationOutput
@@ -106,6 +127,8 @@ def load_scheduler(
                 response_queue,
             ),
             cancel_queue=cancel_queue,
+            max_batch_size=pipeline.max_batch_size,
+            batch_key=batch_key,
         )
     elif pipeline.__class__.__name__ == "EmbeddingsPipeline":
         embeddings_scheduler_config = EmbeddingsSchedulerConfig(

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -203,7 +204,27 @@ class PixelGenerationPipeline(
 
     @property
     def max_batch_size(self) -> int:
-        """Returns 1: pixel generation pipelines process one request at a time."""
+        """Max requests the scheduler may batch into one execution.
+
+        Defaults to 1 (serial). Set ``MODULAR_PIXEL_MAX_BATCH_SIZE`` to enable
+        dynamic batching of compatible requests, but only for executors that
+        opt in via ``supports_dynamic_batching`` (currently FLUX.2-Klein);
+        other pixel paths stay serial.
+        """
+        try:
+            requested = int(
+                os.environ.get("MODULAR_PIXEL_MAX_BATCH_SIZE", "1")
+            )
+        except ValueError:
+            requested = 1
+        if requested <= 1:
+            return 1
+        if (
+            self._use_executor
+            and self._executor is not None
+            and getattr(self._executor, "supports_dynamic_batching", False)
+        ):
+            return requested
         return 1
 
     def execute(
@@ -355,12 +376,21 @@ class PixelGenerationPipeline(
         if not batch:
             return None, []
 
-        # Flatten batch to list of (request_id, context) tuples
+        # Flatten batch to list of (request_id, context) tuples. Multiple
+        # entries are only ever present when the scheduler dynamically
+        # batches compatible requests (executor path with an executor that
+        # advertises ``supports_dynamic_batching``); the executor validates
+        # compatibility and returns images in this flattened order.
         flat_batch = list(batch.items())
 
-        if len(flat_batch) > 1:
+        if len(flat_batch) > 1 and not (
+            self._use_executor
+            and self._executor is not None
+            and getattr(self._executor, "supports_dynamic_batching", False)
+        ):
             raise ValueError(
-                "Batching of different requests is not supported yet."
+                "Batching of different requests is not supported for this "
+                "pixel pipeline."
             )
 
         if self._use_module:

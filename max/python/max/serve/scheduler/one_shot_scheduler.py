@@ -18,9 +18,10 @@ text models). It processes each request serially, making it simple and suitable
 for workloads that don't benefit from batching or continuous generation.
 """
 
+import collections
 import logging
 import queue
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from typing import Generic
 
 from max.pipelines.context import BaseContextType
@@ -69,20 +70,33 @@ class OneShotScheduler(
     def __init__(
         self,
         pipeline: Pipeline[PipelineInputsType, PipelineOutputType],
-        batch_constructor: Callable[[BaseContextType], PipelineInputsType],
+        batch_constructor: Callable[
+            [list[BaseContextType]], PipelineInputsType
+        ],
         request_queue: MAXPullQueue[BaseContextType],
         response_queue: MAXPushQueue[
             dict[RequestID, SchedulerResult[PipelineOutputType]]
         ],
         cancel_queue: MAXPullQueue[list[RequestID]],
         max_batch_size: int = 1,
+        batch_key: Callable[[BaseContextType], Hashable] | None = None,
     ) -> None:
-        self.max_batch_size = max_batch_size
+        self.max_batch_size = max(1, max_batch_size)
         self.pipeline = pipeline
         self.batch_constructor = batch_constructor
         self.request_queue = request_queue
         self.response_queue = response_queue
         self.cancel_queue = cancel_queue
+        # When set (and max_batch_size > 1), requests whose ``batch_key``
+        # matches are executed together in one batch. Requests pulled from
+        # the queue but not yet dispatched wait here across iterations.
+        self.batch_key = batch_key
+        self._pending: collections.deque[BaseContextType] = (
+            collections.deque()
+        )
+        # Upper bound on how many queued requests to buffer while forming a
+        # batch, so a flood of incompatible requests can't grow unbounded.
+        self._drain_cap = max(self.max_batch_size * 8, 64)
 
     @traced
     def _get_next_request(self) -> BaseContextType | None:
@@ -96,36 +110,72 @@ class OneShotScheduler(
         except queue.Empty:
             return None
 
+    def _next_group(self) -> list[BaseContextType]:
+        """Return the next batch of compatible requests to execute.
+
+        Drains newly-queued requests into the pending buffer, then forms a
+        group from the front: the first request plus any later pending
+        requests sharing its ``batch_key``, up to ``max_batch_size``.
+        Non-matching requests stay pending (in order) for later iterations.
+        """
+        while len(self._pending) < self._drain_cap:
+            context = self._get_next_request()
+            if context is None:
+                break
+            self._pending.append(context)
+
+        if not self._pending:
+            return []
+
+        first = self._pending.popleft()
+        group = [first]
+        if self.max_batch_size > 1 and self.batch_key is not None:
+            key = self.batch_key(first)
+            leftover: collections.deque[BaseContextType] = (
+                collections.deque()
+            )
+            while self._pending and len(group) < self.max_batch_size:
+                context = self._pending.popleft()
+                if self.batch_key(context) == key:
+                    group.append(context)
+                else:
+                    leftover.append(context)
+            leftover.extend(self._pending)
+            self._pending = leftover
+        return group
+
     def run_iteration(self) -> SchedulerProgress:
         """Execute one scheduling iteration.
 
-        Pulls a single request from the queue, executes it through the pipeline,
-        and sends the response back.
+        Forms a batch of compatible queued requests, executes them through the
+        pipeline in a single pass, and sends the responses back.
 
         Returns:
             SchedulerProgress.MADE_PROGRESS if a request was processed,
             SchedulerProgress.NO_PROGRESS if no requests were available.
         """
-        # Get the next request
-        context = self._get_next_request()
-        if context is None:
+        group = self._next_group()
+        if not group:
             return SchedulerProgress.NO_PROGRESS
 
-        logger.info(f"OneShotScheduler: Starting request {context.request_id}")
+        request_ids = [context.request_id for context in group]
+        logger.info(
+            "OneShotScheduler: Starting %d request(s): %s",
+            len(group),
+            ", ".join(str(rid) for rid in request_ids),
+        )
 
         try:
-            # Convert the context to pipeline inputs using the batch constructor
-            pipeline_inputs = self.batch_constructor(context)
-
-            # Execute the pipeline
+            # Convert the contexts to pipeline inputs and execute in one pass.
+            pipeline_inputs = self.batch_constructor(group)
             responses = self.pipeline.execute(pipeline_inputs)
 
             logger.info(
-                f"OneShotScheduler: Completed request {context.request_id} "
-                f"with {len(responses)} response(s)"
+                "OneShotScheduler: Completed %d request(s) with %d response(s)",
+                len(group),
+                len(responses),
             )
 
-            # Send the responses
             self.response_queue.put_nowait(
                 {
                     request_id: SchedulerResult.create(response)
@@ -134,12 +184,14 @@ class OneShotScheduler(
             )
         except Exception:
             logger.exception(
-                f"OneShotScheduler: Exception during pipeline execution for request {context.request_id}"
+                "OneShotScheduler: Exception during pipeline execution for "
+                "request(s) %s",
+                ", ".join(str(rid) for rid in request_ids),
             )
 
-            # Send cancelled result (error details are logged above)
+            # Cancel every request in the failed batch (errors logged above).
             self.response_queue.put_nowait(
-                {context.request_id: SchedulerResult.cancelled()}
+                {rid: SchedulerResult.cancelled() for rid in request_ids}
             )
 
         return SchedulerProgress.MADE_PROGRESS
