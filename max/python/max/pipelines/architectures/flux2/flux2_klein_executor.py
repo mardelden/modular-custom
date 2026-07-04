@@ -925,6 +925,23 @@ class Flux2KleinExecutor(
         out = np.ascontiguousarray(np.concatenate(arrs, axis=0))
         return Buffer.from_dlpack(out).to(device)
 
+    @staticmethod
+    def _repeat_interleave(buf: Buffer, repeats: int) -> Buffer:
+        """Repeat each row along axis 0 ``repeats`` times, interleaved.
+
+        ``(N, ...) -> (N*repeats, ...)`` as ``[row0]*repeats, [row1]*repeats,
+        ...`` — the per-context image ordering the pipeline expects. Host-side.
+        """
+        if repeats == 1:
+            return buf
+        device = buf.device
+        if buf.dtype == DType.bfloat16:
+            arr = buf.view(DType.uint16).to_numpy()
+            arr = np.ascontiguousarray(np.repeat(arr, repeats, axis=0))
+            return Buffer.from_dlpack(arr).view(DType.bfloat16).to(device)
+        arr = np.ascontiguousarray(np.repeat(buf.to_numpy(), repeats, axis=0))
+        return Buffer.from_dlpack(arr).to(device)
+
     @traced(message="Flux2KleinExecutor.encode_stacked")
     def _encode_stacked(
         self,
@@ -933,23 +950,15 @@ class Flux2KleinExecutor(
         n_prompts: int,
         num_images: int,
     ) -> Buffer:
-        """Encode each of ``n_prompts`` prompt rows and concat to the batch.
+        """Encode all ``n_prompts`` prompts in one batched forward.
 
-        ``tokens`` is ``(N, S)`` and ``attention_bias`` ``(N, 1, S, S)``.
-        The Qwen3 encoder is batch-1, so each row is encoded separately,
-        broadcast to its ``num_images``, and concatenated into
+        ``tokens`` is ``(N, S)`` and ``attention_bias`` ``(N, 1, S, S)``; the
+        batched Qwen3 encoder returns ``(N, S, D)`` in a single call. Each
+        prompt is then repeated to its ``num_images`` (interleaved) to give
         ``(N * num_images, S, D)``.
         """
-        embeds: list[Buffer] = []
-        for i in range(n_prompts):
-            # Buffer slicing needs an index per axis. Give the encoder a 1D
-            # (S,) token row so its internal 2D-squeeze path is skipped, and
-            # a (1, 1, S, S) bias.
-            tok_i = tokens[i, :]
-            bias_i = attention_bias[i : i + 1, :, :, :]
-            pe = self._encode_prompt(tok_i, bias_i)
-            embeds.append(self._broadcast_batch(pe, num_images))
-        return self._concat_batch(embeds)
+        embeds = self._encode_prompt(tokens, attention_bias)  # (N, S, D)
+        return self._repeat_interleave(embeds, num_images)
 
     def _prepare_scheduler(
         self,

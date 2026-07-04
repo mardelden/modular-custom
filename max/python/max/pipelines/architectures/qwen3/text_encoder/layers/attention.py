@@ -72,25 +72,26 @@ class EncoderAttention(Module):
         """Repeat KV heads for GQA (Grouped Query Attention).
 
         Args:
-            x: Input tensor with shape [seq_len, n_kv_heads, head_dim]
+            x: Input tensor with shape [batch, seq_len, n_kv_heads, head_dim]
             n_rep: Number of times to repeat each head
 
         Returns:
-            Tensor with shape [seq_len, n_kv_heads * n_rep, head_dim]
+            Tensor with shape [batch, seq_len, n_kv_heads * n_rep, head_dim]
         """
         if n_rep == 1:
             return x
 
-        seq_len = x.shape[0]
-        n_kv_heads = x.shape[1]
-        head_dim = x.shape[2]
+        batch = x.shape[0]
+        seq_len = x.shape[1]
+        n_kv_heads = x.shape[2]
+        head_dim = x.shape[3]
 
-        # [S, H_kv, D] -> [S, H_kv, 1, D] -> [S, H_kv, n_rep, D] -> [S, H, D]
-        # Use concat instead of tile: tile has no GPU implementation and forces
-        # a CPU round-trip (DtoH + tile + HtoD) for every layer.
-        x = ops.unsqueeze(x, 2)
-        x = ops.concat([x] * n_rep, axis=2)
-        return ops.reshape(x, (seq_len, n_kv_heads * n_rep, head_dim))
+        # [B, S, H_kv, D] -> [B, S, H_kv, 1, D] -> [B, S, H_kv, n_rep, D]
+        #   -> [B, S, H, D]. Use concat instead of tile: tile has no GPU
+        # implementation and forces a CPU round-trip for every layer.
+        x = ops.unsqueeze(x, 3)
+        x = ops.concat([x] * n_rep, axis=3)
+        return ops.reshape(x, (batch, seq_len, n_kv_heads * n_rep, head_dim))
 
     def __call__(
         self,
@@ -98,56 +99,42 @@ class EncoderAttention(Module):
         rope: RotaryEmbedding,
         attention_bias: TensorValue,
     ) -> TensorValue:
-        """Forward pass computing causal self-attention.
+        """Forward pass computing self-attention over a batch of sequences.
 
         Args:
-            x: Input tensor with shape [total_seq_len, hidden_dim]
+            x: Input tensor with shape [batch, seq_len, hidden_dim]
             rope: RotaryEmbedding module
+            attention_bias: Additive mask, shape [batch, 1, seq_len, seq_len]
         Returns:
-            Output tensor with shape [total_seq_len, hidden_dim]
+            Output tensor with shape [batch, seq_len, hidden_dim]
         """
-        total_seq_len = x.shape[0]
+        batch = x.shape[0]
+        seq_len = x.shape[1]
 
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        q = ops.reshape(q, (total_seq_len, self.n_heads, self.head_dim))
-        k = ops.reshape(k, (total_seq_len, self.n_kv_heads, self.head_dim))
-        v = ops.reshape(v, (total_seq_len, self.n_kv_heads, self.head_dim))
+        q = ops.reshape(q, (batch, seq_len, self.n_heads, self.head_dim))
+        k = ops.reshape(k, (batch, seq_len, self.n_kv_heads, self.head_dim))
+        v = ops.reshape(v, (batch, seq_len, self.n_kv_heads, self.head_dim))
 
-        # Qwen3: norm over head_dim (per-head), then RoPE
+        # Qwen3: norm over head_dim (per-head), then RoPE.
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # module_v3.common_layers RotaryEmbedding.forward expects 4D (B, S, H, D); add batch dim
-        q = ops.squeeze(
-            rope(
-                ops.unsqueeze(q, 0),
-                start_pos=Dim(0),
-                seq_len=total_seq_len,
-            ),
-            0,
-        )
-        k = ops.squeeze(
-            rope(
-                ops.unsqueeze(k, 0),
-                start_pos=Dim(0),
-                seq_len=total_seq_len,
-            ),
-            0,
-        )
+        # RotaryEmbedding.forward expects 4D [B, S, H, D] (already batched).
+        q = rope(q, start_pos=Dim(0), seq_len=seq_len)
+        k = rope(k, start_pos=Dim(0), seq_len=seq_len)
 
-        # GQA: expand K, V if needed
+        # GQA: expand K, V if needed.
         if self.n_kv_heads != self.n_heads:
             n_rep = self.n_heads // self.n_kv_heads
             k = self._repeat_kv(k, n_rep)
             v = self._repeat_kv(v, n_rep)
 
-        q = ops.unsqueeze(q, 0)
-        k = ops.unsqueeze(k, 0)
-        v = ops.unsqueeze(v, 0)
-
+        # q/k/v are [B, S, H, D]; mask [B, 1, S, S] -> [B, S, S] broadcasts
+        # across heads.
         attn_out = masked_flash_attention_gpu(
             q,
             k,
@@ -155,6 +142,5 @@ class EncoderAttention(Module):
             mask=ops.squeeze(attention_bias, axis=1),
             scale=self.scale,
         )
-        attn_out = ops.squeeze(attn_out, 0)
-        attn_out = ops.reshape(attn_out, (total_seq_len, -1))
+        attn_out = ops.reshape(attn_out, (batch, seq_len, -1))
         return self.o_proj(attn_out)
