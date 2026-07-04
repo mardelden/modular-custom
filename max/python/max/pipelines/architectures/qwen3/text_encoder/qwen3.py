@@ -213,12 +213,12 @@ class Qwen3TextEncoderTransformer(Module):
         return (
             TensorType(
                 DType.int64,
-                shape=["total_seq_len"],
+                shape=["batch", "total_seq_len"],
                 device=self.device,
             ),
             TensorType(
                 DType.float32,
-                shape=[1, 1, "total_seq_len", "total_seq_len"],
+                shape=["batch", 1, "total_seq_len", "total_seq_len"],
                 device=self.device,
             ),
         )
@@ -231,12 +231,13 @@ class Qwen3TextEncoderTransformer(Module):
         """Forward pass returning fused prompt embeddings.
 
         Args:
-            tokens: Input token IDs [total_seq_len]
+            tokens: Input token IDs [batch, total_seq_len]
             attention_bias: Additive causal+padding mask bias with shape
-                [1, 1, seq_len, seq_len].
+                [batch, 1, seq_len, seq_len].
 
         Returns:
-            Tuple containing one tensor shaped [1, seq_len, num_layers * hidden_dim].
+            Tuple containing one tensor shaped
+            [batch, seq_len, num_layers * hidden_dim].
         """
         h = self.embed_tokens(tokens)
 
@@ -260,12 +261,13 @@ class Qwen3TextEncoderTransformer(Module):
 
         hidden_states = [selected[i] for i in self._sorted_hidden_state_layers]
 
-        stacked = ops.stack(hidden_states, axis=0)  # [L, S, D]
-        stacked = ops.unsqueeze(stacked, axis=0)  # [1, L, S, D]
-        stacked = ops.permute(stacked, [0, 2, 1, 3])  # [1, S, L, D]
+        stacked = ops.stack(hidden_states, axis=0)  # [L, B, S, D]
+        stacked = ops.permute(stacked, [1, 2, 0, 3])  # [B, S, L, D]
+        batch = stacked.shape[0]
         seq_len = stacked.shape[1]
         return (
             ops.reshape(
-                stacked, [1, seq_len, stacked.shape[2] * stacked.shape[3]]
+                stacked,
+                [batch, seq_len, stacked.shape[2] * stacked.shape[3]],
             ),
         )

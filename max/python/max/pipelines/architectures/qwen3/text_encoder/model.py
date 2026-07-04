@@ -229,18 +229,14 @@ class Qwen3TextEncoderModel(ComponentModel):
 
         Use this when the caller has pre-computed the additive bias (e.g.,
         to share bias construction across positive and negative CFG
-        streams). ``tokens`` may be 1D ``(S,)`` or 2D ``(1, S)``; 2D
-        tokens are squeezed. ``attention_bias`` must be shape
-        ``(1, 1, S, S)`` float32 and already resident on the encoder's
+        streams). The compiled encoder is batched: ``tokens`` is ``(B, S)``
+        and ``attention_bias`` is ``(B, 1, S, S)`` float32, producing
+        ``(B, S, D)``. A 1D ``(S,)`` tokens input is promoted to ``(1, S)``
+        for backward compatibility. Inputs must already be on the encoder's
         device.
         """
-        if len(tokens.shape) == 2:
-            if int(tokens.shape[0]) != 1:
-                raise ValueError(
-                    "Qwen3TextEncoderModel expects batch_size=1 for 2D "
-                    "token input."
-                )
-            tokens = tokens[0]
+        if len(tokens.shape) == 1:
+            tokens = tokens.view(tokens.dtype, (1, int(tokens.shape[0])))
         outputs = self.model.execute(tokens, attention_bias)
         if isinstance(outputs, (list, tuple)):
             return cast(Buffer, outputs[0])
