@@ -1,0 +1,25 @@
+# systemd unit template for serving FLUX.2-Klein NVFP4 on sm_120 with the
+# custom repacked MAX. Copy to /etc/systemd/system/, fill the @PLACEHOLDERS@,
+# `systemctl daemon-reload && systemctl enable --now max-serve-nvfp4`.
+[Unit]
+Description=MAX serve FLUX.2-Klein NVFP4 (sm_120)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=MAX_SERVE_API_TYPES=["openai","responses"]
+Environment=HF_HOME=/mnt/models/huggingface
+Environment=HF_HUB_OFFLINE=1
+# MAX needs the CUDA runtime on the loader path. Point at wherever cuBLAS/cuDNN
+# live: the venv's own nvidia/*/lib dirs, or a copied dir (e.g. /opt/nvidia-libs).
+Environment=LD_LIBRARY_PATH=@CUDA_LIB_DIRS@
+ExecStart=@VENV@/bin/max serve \
+  --model-path @MODEL_BASE@ \
+  --model-override transformer.quantization_encoding=float4_e2m1fnx2 \
+  --model-override transformer.weight_path=["@NVFP4_SAFETENSORS@"] \
+  --device-memory-utilization 0.9
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
