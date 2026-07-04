@@ -173,7 +173,10 @@ class ImageEncoder(CompiledComponent):
 
         config = manifest["vae"]
         config_dict = config.huggingface_config.to_dict()
-        encoding = config.quantization_encoding or "bfloat16"
+        # The FLUX.2 VAE is always bf16; ignore a global quantization encoding
+        # (e.g. float4 set for an NVFP4 transformer) that would otherwise make
+        # the encoder expect packed FP4 weights.
+        encoding = "bfloat16"
         devices = load_devices(config.device_specs)
 
         vae_config = AutoencoderKLFlux2Config.generate(

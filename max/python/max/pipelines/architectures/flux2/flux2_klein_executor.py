@@ -255,6 +255,12 @@ class Flux2KleinExecutor(
             if encoding == "float4_e2m1fnx2"
             else supported_encoding_dtype(encoding)
         )
+        # Only the transformer may be NVFP4-quantized (it ships as a
+        # transformer-only checkpoint combined with a bf16 base repo). A
+        # global quantization encoding also leaks to the text encoder and VAE,
+        # which are always bf16 for Klein -- force those two to bf16 at the
+        # point of use (MAXModelConfig can't be mutated in place).
+        self._component_encoding = "bfloat16" if encoding == "float4_e2m1fnx2" else None
         if len(transformer_config.device_specs) != 1:
             raise ValueError(
                 "FLUX.2-Klein is only supported on a single device"
@@ -281,7 +287,9 @@ class Flux2KleinExecutor(
         self._text_encoder_device: Device = text_encoder_devices[0]
         self.text_encoder = Qwen3TextEncoderKleinModel(
             config=text_encoder_entry.huggingface_config.to_dict(),
-            encoding=text_encoder_entry.quantization_encoding or "bfloat16",
+            encoding=self._component_encoding
+            or text_encoder_entry.quantization_encoding
+            or "bfloat16",
             devices=text_encoder_devices,
             weights=load_weights(text_encoder_entry.resolved_weight_paths()),
             session=session,
