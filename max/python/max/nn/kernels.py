@@ -6333,6 +6333,65 @@ def _apple_weight_only_block_scaled_matmul(
     return result
 
 
+def _cuda_weight_only_block_scaled_matmul(
+    a: TensorValue,
+    b: TensorValue,
+    b_scales: TensorValue,
+    out_type: DType = DType.bfloat16,
+) -> TensorValue:
+    """NVIDIA weight-only NVFP4 (W4A16) matmul: ``out = a @ dequant(b).T``.
+
+    The NVIDIA sibling of :func:`_apple_weight_only_block_scaled_matmul`, for
+    NVIDIA GPUs without the SM100 native block-scaled FP4 tensor-core path (e.g.
+    sm_120). Same W4A16 contract: the activation ``a`` stays ``bfloat16`` (it is
+    *not* dynamically quantized to FP4) and the weight block scales are plain
+    rank-2 ``[N, K // 16]`` (not the SM100 rank-5 TCGEN05 interleave). The kernel
+    dequantizes the packed FP4 weight to a transient dense bf16 buffer, then runs
+    the existing dense bf16 GEMM; weights stay 4-bit-resident in DRAM.
+
+    The NVFP4 per-tensor ``weight_scale_2`` scalar is *not* an argument here —
+    the caller applies it as a post-matmul graph-level multiply.
+
+    Args:
+        a: The bf16 activation, shape ``[M, K]``.
+        b: The packed FP4 weight, ``uint8`` shape ``[N, K // 2]`` (two ``e2m1``
+            nibbles per byte, low nibble first).
+        b_scales: The FP8-E4M3 block scales, ``float8_e4m3fn`` shape
+            ``[N, K // 16]`` (block size 16 along K).
+        out_type: The output dtype (``bfloat16``, ``float16``, or ``float32``).
+
+    Returns:
+        The matmul result, shape ``[M, N]``.
+    """
+    if a.rank != 2 or b.rank != 2:
+        raise ValueError("Both a and b must be rank 2 tensors")
+    if b_scales.rank != 2:
+        raise ValueError("b_scales must be a rank 2 tensor")
+    if a.dtype != DType.bfloat16:
+        raise ValueError(f"activation a must be bfloat16, got {a.dtype}")
+    if b.dtype != DType.uint8:
+        raise ValueError(
+            f"weight b must be uint8 (fp4-e2m1fnX2), got {b.dtype}"
+        )
+    if b_scales.dtype != DType.float8_e4m3fn:
+        raise ValueError(
+            f"b_scales must be float8_e4m3fn, got {b_scales.dtype}"
+        )
+
+    result = ops.custom(
+        "mo.matmul.weight.only.block.scaled.cuda",
+        device=a.device,
+        values=[a, b, b_scales],
+        out_types=[
+            TensorType(
+                dtype=out_type, shape=[a.shape[0], b.shape[0]], device=a.device
+            )
+        ],
+    )[0].tensor
+
+    return result
+
+
 def dynamic_block_scaled_matmul_mxfp4(
     a: TensorValue,
     b: TensorValue,
@@ -6470,6 +6529,23 @@ def _is_apple_gpu() -> bool:
     """Checks if the current accelerator is an Apple (Metal) GPU."""
     try:
         return accelerator_api() == "metal"
+    except Exception:
+        return False
+
+
+def _is_cuda_fp4_gpu() -> bool:
+    """NVIDIA GPUs that take the weight-only (W4A16) FP4 path.
+
+    True for NVIDIA accelerators that lack the SM100 native block-scaled FP4
+    tensor-core path (tcgen05/UMMA) — e.g. sm_120 / sm_121 (RTX PRO 6000
+    Blackwell), the validated target. SM100 (B200) keeps its native path, and
+    Apple/AMD have their own W4A16 launchers, so both are excluded here.
+    """
+    try:
+        return (
+            accelerator_api() == "cuda"
+            and not accelerator_architecture_name().startswith("sm_10")
+        )
     except Exception:
         return False
 

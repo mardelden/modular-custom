@@ -16,12 +16,14 @@ from max.graph import DeviceRef, TensorValue, ops
 
 from .kernels import (
     _apple_weight_only_block_scaled_matmul,
+    _cuda_weight_only_block_scaled_matmul,
     _fused_qkv_index_ragged_matmul_scaled_mxfp8,
     _fused_qkv_ragged_matmul_scaled_float4,
     _fused_qkv_ragged_matmul_scaled_float8,
     _fused_qkv_ragged_matmul_scaled_mxfp8,
     _grouped_matmul_rowwise_dynamic_scaled_fp8,
     _is_apple_gpu,
+    _is_cuda_fp4_gpu,
     block_scales_interleave,
     convert_weights_to_fp8_fnuz_if_needed,
     dynamic_block_scaled_matmul,
@@ -128,6 +130,32 @@ def _matmul_float4(
         # only). Do the multiply in f32 for precision, then cast the product to
         # bf16 -- folding a bf16-rounded scale would lose mantissa bits before
         # the multiply.
+        return (res.cast(DType.float32) * weight_scale_2.to(res.device)).cast(
+            DType.bfloat16
+        )
+
+    if _is_cuda_fp4_gpu():
+        # NVIDIA weight-only (W4A16) path for GPUs without the SM100 native
+        # block-scaled FP4 tensor cores (e.g. sm_120). Identical contract to the
+        # Apple branch above -- bf16 activation, plain rank-2 ``[N, K // 16]``
+        # scales, ``weight_scale_2`` folded post-matmul -- only the kernel
+        # differs (materialize the FP4 weight to a transient dense bf16 buffer,
+        # then the existing dense bf16 GEMM). SM100 keeps its native path below.
+        weight_scale = weight_scale.to(x.device)
+        if scales_pre_interleaved:
+            # As with Apple, the rank-2 [N, K//16] consumer cannot read the
+            # SM100 5D-flattened layout. The FLUX.2 adapter deinterleaves to
+            # true rank-2 at load (scales_pre_interleaved=False).
+            raise NotImplementedError(
+                "CUDA W4A16 path requires deinterleaved rank-2 weight scales "
+                "(scales_pre_interleaved=False)"
+            )
+        res = _cuda_weight_only_block_scaled_matmul(
+            x,
+            weight,
+            weight_scale,
+            out_type=DType.bfloat16,
+        )
         return (res.cast(DType.float32) * weight_scale_2.to(res.device)).cast(
             DType.bfloat16
         )

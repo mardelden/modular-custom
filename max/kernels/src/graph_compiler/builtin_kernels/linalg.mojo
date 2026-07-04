@@ -21,6 +21,7 @@ from std.sys.info import (
     simd_width_of,
     _accelerator_arch,
     has_apple_gpu_accelerator,
+    has_nvidia_gpu_accelerator,
 )
 import extensibility as compiler
 
@@ -45,6 +46,7 @@ from linalg.matmul.gpu.amd import (
 )
 from linalg.mxfp4_matmul_sm90 import mxfp4_matmul_sm90
 from linalg.matmul.gpu.apple.fp4_matmul import enqueue_apple_fp4_matmul
+from linalg.matmul.gpu.nvfp4_w4a16_cuda import nvfp4_w4a16_matmul_cuda
 from linalg.grouped_matmul_sm100_blockwise_fp8 import (
     grouped_matmul_dynamic_scaled_fp8,
 )
@@ -1048,6 +1050,53 @@ struct Struct_matmul_weight_only_block_scaled_apple:
         )
 
         enqueue_apple_fp4_matmul[c_type=c_type](
+            c.to_tile_tensor[DType.int64](),
+            a.to_tile_tensor[DType.int64](),
+            b.to_tile_tensor[DType.int64](),
+            b_scales.to_tile_tensor[DType.int64](),
+            context,
+        )
+
+
+@compiler.register("mo.matmul.weight.only.block.scaled.cuda")
+struct Struct_matmul_weight_only_block_scaled_cuda:
+    """NVIDIA weight-only NVFP4 (W4A16) matmul: `out = a @ dequant(b)^T`.
+
+    The NVIDIA sibling of `mo.matmul.weight.only.block.scaled.apple`, for NVIDIA
+    GPUs that lack the SM100 native block-scaled FP4 tensor-core path (e.g.
+    sm_120, which has no tcgen05/UMMA). Like the Apple op -- and unlike the
+    SM100 `mo.matmul.dynamic.block.scaled` path -- the activation `a` stays bf16
+    (NOT dynamically quantized to FP4) and the weight block scales are PLAIN
+    rank-2 `[N, K // 16]` (NOT the SM100 rank-5 TCGEN05 interleave). The packed
+    FP4 weight is dequantized to a transient dense bf16 buffer, then run through
+    the existing dense bf16 GEMM (`nvfp4_w4a16_matmul_cuda`); weights stay
+    4-bit-resident in DRAM. The NVFP4 per-tensor `weight_scale_2` scalar is
+    applied at the graph level by the caller (a post-matmul multiply), so it is
+    not an input here.
+    """
+
+    @always_inline
+    @staticmethod
+    def execute[
+        c_type: DType,
+        //,
+        target: StaticString,
+    ](
+        c: OutputTensor[dtype=c_type, rank=2, ...],
+        a: InputTensor[dtype=DType.bfloat16, rank=2, ...],
+        b: InputTensor[dtype=DType.uint8, rank=2, ...],
+        b_scales: InputTensor[dtype=DType.float8_e4m3fn, rank=2, ...],
+        context: DeviceContext,
+    ) raises:
+        comptime assert is_gpu[
+            target
+        ](), "NVIDIA weight-only block-scaled matmul only supports GPUs"
+        comptime assert has_nvidia_gpu_accelerator(), (
+            "mo.matmul.weight.only.block.scaled.cuda requires an NVIDIA GPU"
+            " accelerator"
+        )
+
+        nvfp4_w4a16_matmul_cuda(
             c.to_tile_tensor[DType.int64](),
             a.to_tile_tensor[DType.int64](),
             b.to_tile_tensor[DType.int64](),
