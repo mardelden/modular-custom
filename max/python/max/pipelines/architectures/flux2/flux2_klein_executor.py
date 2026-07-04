@@ -29,6 +29,7 @@ checkpoints disable CFG regardless of request inputs.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, fields, replace
 from typing import Any, ClassVar
@@ -261,6 +262,16 @@ class Flux2KleinExecutor(
         model_devices = load_devices(transformer_config.device_specs)
         self._model_device: Device = model_devices[0]
         self._in_channels: int = 128
+        # The VAE decoder's GroupNorm kernel hits CUDA_ERROR_LAUNCH_OUT_OF_
+        # RESOURCES for large batches (~>=6-8), independent of resolution.
+        # The denoise loop handles the full batch fine, so decode in safe
+        # sub-groups of this size and stitch. Configurable.
+        try:
+            self._vae_decode_chunk: int = max(
+                1, int(os.environ.get("MODULAR_PIXEL_VAE_DECODE_CHUNK", "4"))
+            )
+        except ValueError:
+            self._vae_decode_chunk = 4
         self._is_distilled: bool = bool(
             manifest.metadata.get("is_distilled", False)
         )
@@ -646,8 +657,33 @@ class Flux2KleinExecutor(
             do_cfg=do_cfg,
         )
 
-        images = self.decoder(latents, inputs.h_carrier, inputs.w_carrier)
+        images = self._decode_chunked(
+            latents, inputs.h_carrier, inputs.w_carrier
+        )
         return Flux2ExecutorOutputs(images=images)
+
+    @traced(message="Flux2KleinExecutor.decode_chunked")
+    def _decode_chunked(
+        self, latents: Buffer, h_carrier: Buffer, w_carrier: Buffer
+    ) -> Buffer:
+        """Run the VAE decoder in batch sub-chunks and stitch the images.
+
+        Works around the VAE GroupNorm kernel's per-launch resource limit for
+        large batches: the denoise loop ran the full batch, but the decoder is
+        called on at most ``_vae_decode_chunk`` samples at a time. The shape
+        carriers are batch-independent (per-resolution), so they are reused.
+        """
+        total = int(latents.shape[0])
+        chunk = self._vae_decode_chunk
+        if total <= chunk:
+            return self.decoder(latents, h_carrier, w_carrier)
+        parts: list[Buffer] = []
+        for start in range(0, total, chunk):
+            end = min(start + chunk, total)
+            parts.append(
+                self.decoder(latents[start:end, :, :], h_carrier, w_carrier)
+            )
+        return self._concat_batch(parts)
 
     @traced(message="Flux2KleinExecutor.encode_prompt")
     def _encode_prompt(self, tokens: Buffer, attention_bias: Buffer) -> Buffer:
