@@ -86,9 +86,10 @@ def nvfp4_w4a16_matmul_cuda(
     enqueue_fp4_materialize[DType.bfloat16](wdense_tt, b_packed, b_scales, ctx)
 
     # Step 2: dense bf16 GEMM, `out = a @ w_dense^T` (the same tensor-core path
-    # the bf16 model already uses on this GPU).
+    # the bf16 model already uses on this GPU). `wdense_tt` is passed directly
+    # (read-only in the GEMM), matching the AMD `mxfp4_dequant_matmul_amd` call.
     _matmul_gpu[use_tensor_core=True, transpose_b=True](
-        c, a, wdense_tt.as_immut(), ctx
+        c, a, wdense_tt, ctx
     )
 
     # Keep the transient weight alive through the async materialize + GEMM
