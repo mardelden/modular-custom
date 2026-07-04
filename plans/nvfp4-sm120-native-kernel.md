@@ -1,71 +1,158 @@
-# Plan: Native NVFP4 matmul for FLUX.2-Klein on sm_120 (RTX PRO 6000 Blackwell)
+# Plan: NVFP4 (W4A16) matmul for FLUX.2-Klein on sm_120 (RTX PRO 6000 Blackwell)
 
-> Status: Proposed. Target = native sm_120 FP4 tensor-core matmul (full speed + VRAM), reached via de-risking phases.
-> Mirror of the plan-mode file `~/.claude/plans/vast-booping-feather.md`.
+> Status: **Reshaped 2026-07-04** after discovering upstream already landed the
+> generic W4A16 scaffolding. Target = correct NVFP4 on sm_120 with the VRAM win
+> at ~bf16 speed (materialize→dense), with an optional later fused/native path
+> for full FP4 throughput.
+> Branch `feat/nvfp4-sm120-native-kernel` is **rebased onto upstream/main
+> `d35568099c` (July 3 nightly, Mojo dev2026070306 / MAX 26.5.0.dev2026070306)**.
+> Backup of the pre-rebase state: branch `backup/nvfp4-pre-rebase-20260704`.
 
-## Context
+## What changed vs the original plan
 
-`black-forest-labs/FLUX.2-klein-9b-nvfp4` is downloaded on `max-serve` but cannot run: the NVFP4 (`float4_e2m1fnx2`) block-scaled matmul in MAX is **SM100 (B200)-only**, and this box is **sm_120** (workstation Blackwell, compute cap 12.0). Loading is already solved (a combined bf16-base + NVFP4-transformer repo + forcing text_encoder/VAE to bf16); the remaining wall is compute:
+Upstream commit **`06e82346ae [Kernels][MAX] Apple M5: NVFP4 W4A16 for
+FLUX.2-dev`** (Fabio Riccardi, merged Jul 2) already built the entire generic
+weight-only (W4A16) seam we were going to write from scratch, and it
+**side-steps the sm_120 rank-5 wall entirely**:
 
-```
-_matmul_float4 -> dynamic_block_scaled_matmul:
-ValueError: Both a_scales and b_scales must be rank 5 tensors
-```
+- **`_matmul_float4` W4A16 branch** (`max/python/max/nn/quant_ops.py:98`):
+  activations stay **bf16** (NOT dynamically quantized to FP4), weight block
+  scales are **plain rank-2 `[N, K//16]`** (NOT the SM100 rank-5 TCGEN05
+  interleave — this is exactly the layout sm_120 could not produce), FP4 weight
+  dequantized to bf16 in-register, and `weight_scale_2` folded as a post-matmul
+  scalar multiply. Only the *guard* (`_is_apple_gpu()`) and the *kernel* are
+  platform-specific; the seam is generic.
+- **Portable dequant kernel** `fp4_materialize_kernel` /
+  `enqueue_fp4_materialize` (`max/kernels/src/linalg/matmul/gpu/apple/
+  fp4_dequant.mojo`): explicitly **"hardware-neutral — plain LUT + scale, no
+  PTX / MFMA intrinsics"**. One thread per output element, `E2M1_TO_FLOAT32[nib]
+  * |block_scale|`. **Reusable verbatim on sm_120/CUDA.**
+- **materialize→dense launcher** `_enqueue_apple_fp4_materialize_dense`
+  (`fp4_matmul.mojo:720`): transient `[N,K]` bf16 buffer ← `enqueue_fp4_
+  materialize` ← packed FP4 + scales, then the platform dense bf16 GEMM. Its
+  docstring names **`mxfp4_dequant_matmul_amd` as "the AMD W4A16 sibling"** — so
+  this "portable materialize + platform dense GEMM" pattern already ships for
+  **Apple and AMD**. NVIDIA/sm_120 is the missing third sibling.
+- **Mixed-precision diffusion pipeline plumbing**: per-component encodings via
+  `--model-override 'transformer.quantization_encoding=float4_e2m1fnx2'`, a
+  `latents_in_dtype` cast at the transformer→VAE graph boundary
+  (`vae_decoder.py`), and an f32→bf16 weight-path fallback
+  (`lib/config/model_config.py:682`). This **supersedes our Phase-0 forced-bf16
+  hacks and the 21 GB combined-repo** (use the base repo + `--model-override
+  transformer.weight_path=<nvfp4 safetensors>` instead). Landed on
+  `flux2_executor.py` (FLUX.2-**dev**) — must be ported to our
+  `flux2_klein_executor.py` (FLUX.2-**Klein**).
 
-**Root cause (verified):** `quantize_dynamic_block_scaled` (`max/python/max/nn/kernels.py:6485`) gates on `_is_sm10x_gpu()` (`kernels.py:6403`, `startswith("sm_10")`). SM100 gets rank-5 "SF-atom" scales for the tcgen05/UMMA kernel; sm_120 falls into the rank-2 "CDNA4 proxy" branch, which `dynamic_block_scaled_matmul` (`kernels.py:6164`) rejects. Even un-gated, the Mojo kernel `block_scaled_matmul` (`max/kernels/src/linalg/fp4_quantization.mojo:1711`) hard-asserts B200, and **sm_120 has no `tcgen05`/UMMA** (`mojo/stdlib/std/sys/info.mojo:581`, `_SM_120X_ARCHS` at `:554`). The block-scaled FP4 MMA intrinsic (`UMMAKind.KIND_MXF4NVF4`) exists **only** as SM100 UMMA (`mojo/stdlib/std/gpu/compute/arch/mma_nvidia_sm100.mojo:58`); the general `mma.sync` layer (`mma_nvidia.mojo`) has **zero** FP4/block-scaled support.
+**Consequence:** native sm_120 FP4 `mma.sync` PTX intrinsics — the multi-week
+hard part of the old plan — are **no longer required** for a correct,
+VRAM-saving, ~bf16-speed result. They become an optional later perf phase.
 
-**Goal (chosen):** a **native sm_120 NVFP4 block-scaled `mma.sync` matmul** — real FP4 tensor-core speedup + the ~13 GB VRAM win — reached through de-risking phases so we always have a correct, working fallback and a correctness oracle before the hard PTX bring-up. FLUX.2-Klein attention/MLP use plain `Linear` (`flux2/layers/flux2_attention.py:794`), so the only hot path to fix is `_matmul_float4` (`max/python/max/nn/quant_ops.py:73`); the fused-QKV float4 path (`quant_ops.py:455`) is an LLM path FLUX.2 never hits.
-
-## Scope note on the build boundary
-- `.py` changes deploy by **scp + restart** (no build). Every Mojo kernel change requires **`./bazelw build //max/kernels/...`** and deploying rebuilt kernel artifacts into the vendor wheel's `_interpreter_ops/__mojocache__/` (heavy, ABI-coupled). Phase 2 is the first time we cross this line and stand up the kernel build/deploy loop; Phase 3 lives entirely on the Mojo side.
-- All changes are gated behind `not _is_sm10x_gpu()` / an explicit sm_120 predicate. bf16 layers never enter `_matmul_float4`, so the working bf16 pipeline is untouched.
+## Op / dispatch API to mirror (already in tree post-rebase)
+- Op registration `mo.matmul.weight.only.block.scaled.apple`
+  (`max/kernels/src/graph_compiler/builtin_kernels/linalg.mojo:1016`) — asserts
+  `has_apple_gpu_accelerator()`. Model a `.cuda` sibling on it.
+- Python wrapper `_apple_weight_only_block_scaled_matmul`
+  (`max/python/max/nn/kernels.py:6278`); guard `_is_apple_gpu()`
+  (`kernels.py:6469`). Model `_cuda_weight_only_block_scaled_matmul` +
+  `_is_cuda_fp4_gpu()` on them.
+- AMD sibling launcher to read for the NVIDIA dense-GEMM wiring:
+  `mxfp4_dequant_matmul_amd` (grep `max/kernels/src/linalg`).
 
 ---
 
-## Phase 0 — Loading (already done; needs committing)
-Deployed on `max-serve`, uncommitted in the fork: `flux2_klein_executor.py` (`self._component_encoding`), `flux2/components/vae_decoder.py` + `image_encoder.py` (force VAE bf16). Plus the combined repo `/mnt/models/klein-9b-nvfp4-full` and a `bazelw`-free CLI recipe (`--model-path <combined> --quantization-encoding float4_e2m1fnx2`). Action: commit these as "NVFP4 loading support (SM100-ready)".
+## Phase A — Mixed-precision loading via upstream mechanism (Python only, no build)
+Replace our Phase-0 hacks with the upstream approach, ported to Klein.
+- **Drop** the forced `encoding = "bfloat16"` in `flux2/components/
+  vae_decoder.py` + `image_encoder.py` and the `_component_encoding` override in
+  `flux2_klein_executor.py` (commit `a5bc2d85a2`). Rely on `--model-override`
+  per-component encoding + the f32→bf16 fallback in `model_config.py`.
+- **Port** the `latents_in_dtype` cast (transformer→VAE boundary) into the Klein
+  executor's `VaeDecoder` construction (mirror `flux2_executor.py`'s
+  `latents_in_dtype=self._model_dtype`). Confirm whether Klein's VAE compiles
+  bf16 (then it's a no-op) or f32.
+- **Verify** the `--model-override` path resolves for the Klein arch/executor
+  (it was written for `flux2`/`flux2_executor`; Klein may need the same override
+  plumbing). Serve base Klein repo + `--model-override transformer.
+  quantization_encoding=float4_e2m1fnx2` + `transformer.weight_path=<nvfp4>`.
+- Deploy: scp `.py` only (July-2 wheel is fine for Python-only). No combined
+  repo needed. Loads NVFP4; matmul still errors on sm_120 until Phase C.
 
-## Phase 1 — Host-dequant validation (Python only, NO build) — correctness oracle
-Prove the FLUX.2 NVFP4 math end-to-end with zero Mojo work; produce the reference image every later phase is checked against.
-- In `max/python/max/pipelines/architectures/flux2/nvfp4_weight_adapter.py` (`convert_nvfp4_state_dict`, ~`:146`), port the numpy of `_dequantize_nvfp4_to_bf16` (`max/tests/integration/nn/ep/test_ep_moe_fp4.py:58-94`): per nvfp4 layer, combine `weight` (uint8 `[out,in//2]`), `weight_scale` (f8e4m3 `[out,in//16]`, already row-major after `_deinterleave_scales` at `nvfp4_weight_adapter.py:97`), `weight_scale_2` (f32 scalar) → one bf16 `[out,in]` `.weight`; drop the FP4 tensors. Nibble order already correct via `_swap_fp4_nibbles` (`:57`).
-- Make those layers plain bf16 `Linear`: gate on sm_120 (or env flag) to make `nvfp4_layers_bfl` empty (`flux2/components/denoise_compute.py:214`) and pass `quant_config=None`, taking the `x @ weight.T` path (`max/python/max/nn/linear.py:576`).
-- **Deploy:** scp `.py` only. **Verify:** load combined repo, generate fixed prompt+seed, save as the NVFP4 reference image. (No VRAM win — weights are bf16 — but the pipeline is proven.)
+## Phase B — Host-dequant oracle (Python only, no build) — OPTIONAL
+Now largely redundant: the dequant math is already covered by the Apple/AMD
+W4A16 tests and the portable `fp4_materialize_kernel`. Keep as a zero-build
+fallback if we need a pure-Python reference image before the kernel builds:
+numpy-port `_dequantize_nvfp4_to_bf16` (`max/tests/integration/nn/ep/
+test_ep_moe_fp4.py:58`) in `nvfp4_weight_adapter.py`, make nvfp4 layers plain
+bf16 `Linear`. Generate the fixed prompt+seed reference image = correctness
+oracle for Phase C.
 
-## Phase 2 — GPU dequant kernel + fused dequant→bf16 GEMM (first bazelw build) — working NVFP4 with VRAM win
-Stand up the kernel build/deploy loop and get NVFP4 running on-device at ~bf16 speed with weights kept packed.
-- **New Mojo kernel** `dequant_nvfp4` (new `max/kernels/src/linalg/nvfp4_dequant.mojo`, modeled on `mxfp4_dequant.mojo:48-121`): `SF_VECTOR_SIZE=16` (`fp4_utils.mojo:28`), scales `float8_e4m3fn` (`fp4_utils.mojo:32`, plain f32 cast — drop E8M0 handling), extra `* weight_scale_2`. Reuse `cast_uint_to_fp4e2m1` (`fp4_utils.mojo:98`) unchanged. Register op `mo.dequant.nvfp4` in `max/kernels/src/graph_compiler/builtin_kernels/quantization.mojo` (mirror `Struct_dequant_mxfp4` at `:777`).
-- **Python:** add `nvfp4_dequant(...)` wrapper to `kernels.py` (mirror `mxfp4_dequant` at `:6337`); in `_matmul_float4` (`quant_ops.py:73`), before `:96`, branch `if not _is_sm10x_gpu(): return x @ nvfp4_dequant(weight, weight_scale, weight_scale_2).T` (activations stay bf16; `input_scale` unused).
-- **VRAM caveat:** a standalone dequant of a constant weight may be constant-folded (bf16 in the artifact — no VRAM win). To guarantee the win, promote to a **fused dequant→GEMM** single kernel modeled on `mxfp4_matmul_sm90.mojo:27-95` (dequant in smem/regs → the sm_120 `multistage_gemm` bf16/fp8 GEMM at `matmul/gpu/__init__.mojo:651`). This fused kernel is the structural bridge into Phase 3.
-- **Deploy:** `bazelw` kernel build + artifact deploy, then scp the `.py`. **Verify:** generate, pixel-compare to the Phase 1 reference; confirm no rank-5 / no B200 assert.
+## Phase C — CUDA/sm_120 W4A16 materialize→dense (first bazelw build) — THE MAIN TASK
+Add the missing NVIDIA sibling to the existing W4A16 machinery.
+1. **Mojo launcher** `_enqueue_cuda_fp4_materialize_dense` (new
+   `max/kernels/src/linalg/matmul/gpu/.../fp4_matmul_cuda.mojo` or fold into an
+   existing NVIDIA linalg file): transient `[N,K]` bf16 buffer ←
+   `enqueue_fp4_materialize[bf16]` (portable, reuse as-is) ← packed FP4 +
+   scales, then the **existing NVIDIA dense bf16 GEMM** (`linalg.matmul` /
+   `matmul/gpu` multistage; find the entry point the AMD sibling uses). Same
+   stream-ordered transient-buffer lifetime idiom (`_ = wdense_dev^`).
+2. **Op registration** `mo.matmul.weight.only.block.scaled.cuda` in
+   `builtin_kernels/linalg.mojo` — mirror `Struct_matmul_weight_only_block_
+   scaled_apple`, assert a CUDA/NVIDIA accelerator instead of Apple.
+3. **Python wrapper** `_cuda_weight_only_block_scaled_matmul` in `kernels.py`
+   (mirror the Apple wrapper) + guard `_is_cuda_fp4_gpu()` (sm_120/sm_121; extend
+   later). In `_matmul_float4` (`quant_ops.py:95`), add a branch **before** the
+   Apple branch: `if _is_cuda_fp4_gpu(): res = _cuda_weight_only_block_scaled_
+   matmul(...); return (res.f32 * weight_scale_2).bf16` — identical scalar fold.
+4. **Deploy:** first kernel build — `./bazelw build //max/kernels/...`, deploy
+   rebuilt kernel artifacts into the max-serve wheel's mojocache, **and bump the
+   max-serve wheel to the July-3 nightly (`dev2026070306`)** so built kernels are
+   ABI-matched to the runtime. Then scp the `.py`.
+5. **Verify:** load NVFP4 Klein, generate fixed prompt+seed, pixel-compare to the
+   Phase B oracle (or the bf16 baseline structurally). Confirm the VRAM drop
+   (transformer weights stay 4-bit resident; the bf16 weight is a per-op
+   transient). Result: correct NVFP4 + VRAM win at ~bf16 speed.
 
-## Phase 3 — Native sm_120 FP4 block-scaled `mma.sync` matmul (the goal)
-Real FP4 tensor-core throughput. This is the hard, PTX-level, multi-week work.
-1. **New PTX intrinsics (foundational, does not exist today):** add sm_120 block-scaled FP4 `mma.sync` (the `mma.sync.aligned.*.kind::mxf4nvf4.block_scale` family, valid on `ptx87`/`sm_120a` per `mojo/stdlib/std/gpu/host/info.mojo:1047`) to the Mojo GPU layer alongside `mma_nvidia.mojo` (which has none) — the sm_120 analogue of the SM100 UMMA `KIND_MXF4NVF4` (`mma_nvidia_sm100.mojo:58`). Includes the register scale-operand plumbing.
-2. **sm_120 scale layout:** the SM100 rank-5 SF-atom interleave (`kernels.py:6487`) is a tcgen05 artifact; sm_120's warp-level `mma.sync` wants a different scale register layout. Add an sm_120 branch to `quantize_dynamic_block_scaled` (`kernels.py:6485`) + a matching `block_scales_interleave` variant (`kernels.py:6695`), or use rank-2 directly if the sm_120 MMA accepts it.
-3. **Kernel:** new `nvfp4_matmul_sm120.mojo` reusing `fp4_utils.mojo` (unpack) + the `matmul/gpu` tiling/TMA/scheduler infra, modeled structurally on the SM100 kernel (`grouped_matmul_sm100_1d1d.mojo:1148`) but on the `mma.sync` model (not UMMA/tcgen05). Dispatch: add an sm_120 branch in `block_scaled_matmul` (`fp4_quantization.mojo:1669`) before the B200 assert at `:1711`.
-4. **Python dispatch:** replace `_is_sm10x_gpu()` with an `_is_fp4_tensorcore_gpu()` predicate matching sm_120/sm_121 in `quantize_dynamic_block_scaled` (`kernels.py:6485`), `dynamic_block_scaled_matmul` (`kernels.py:6164`), and `_matmul_float4` (`quant_ops.py:96`); route sm_120 to the native path instead of the Phase 2 dequant fallback.
-- **Deploy:** `bazelw` kernel build + artifacts + scp `.py`. **Verify:** pixel-compare to the Phase 1 reference (correctness), then benchmark per-denoise-step latency vs Phase 2 dequant and the bf16 baseline to confirm the speedup. Keep the Phase 2 dequant path as the fallback for any non-sm_10x/non-sm_120 GPU.
+## Phase D — Fused / native sm_120 FP4 for full throughput — OPTIONAL, LATER
+Only if Phase C's DRAM-bound materialize is too slow. Options, cheapest first:
+1. **Fused in-register dequant** CUDA kernel (dequant B fragment in the GEMM
+   loader seam, weight stays 4-bit in DRAM) — the CUDA analogue of Apple's fused
+   `AppleM5Fp4MatMul` / the AMD fused path. No new PTX; reuses bf16 MMA.
+2. **Native sm_120 block-scaled FP4 `mma.sync`** (`mma.sync...kind::mxf4nvf4.
+   block_scale`, valid on `sm_120a`/`ptx87`) — the old Phase 3. Real FP4
+   tensor-core throughput; writes new PTX intrinsics that don't exist in Mojo
+   today (`mma_nvidia.mojo` has none; `KIND_MXF4NVF4` is SM100 UMMA only). Highest
+   effort; defer until proven necessary.
 
 ---
-
-## Critical files
-- Python dispatch: `max/python/max/nn/quant_ops.py` (`_matmul_float4:73`), `max/python/max/nn/kernels.py` (`quantize_dynamic_block_scaled:6411`, `dynamic_block_scaled_matmul:6127`, `block_scales_interleave:6695`, `_is_sm10x_gpu:6403`).
-- Mojo kernels: new `max/kernels/src/linalg/nvfp4_dequant.mojo` + `nvfp4_matmul_sm120.mojo`; `max/kernels/src/graph_compiler/builtin_kernels/quantization.mojo` (op registration); `fp4_quantization.mojo:1669-1711` (dispatch/gate); new sm_120 MMA intrinsics near `mojo/stdlib/std/gpu/compute/arch/mma_nvidia.mojo`.
-- Reuse (unchanged): `fp4_utils.mojo` (`cast_uint_to_fp4e2m1:98`, `E2M1_TO_FLOAT32:39`); `mxfp4_dequant.mojo` + `mxfp4_matmul_sm90.mojo` (models); `grouped_matmul_sm100_1d1d.mojo:1148` (SM100 reference); `matmul/gpu` multistage GEMM (sm_120 bf16 path); `test_ep_moe_fp4.py:58-94` (correctness reference).
-- Loading (Phase 0): `flux2_klein_executor.py`, `flux2/components/{vae_decoder,image_encoder}.py`, `flux2/nvfp4_weight_adapter.py`.
 
 ## Verification (all phases)
-Load the combined NVFP4 repo on `max-serve`; generate a fixed prompt+seed image via `/v1/responses`; compare against the Phase 1 host-dequant reference (structure should match; only quant error differs). Phase 3 adds a per-denoise-step latency benchmark vs Phase 2 and bf16. Escalating oracle: Phase 1 image is the ground truth for Phases 2 and 3.
+Serve Klein NVFP4 on `max-serve`; generate a fixed prompt+seed image via
+`/v1/responses`; compare to the bf16 baseline (structure) and, if built, the
+Phase B host-dequant oracle (only quant error should differ). Phase C adds a
+VRAM-residency check and a per-denoise-step latency number vs bf16. The
+Apple/AMD W4A16 tests (`test/gpu/linalg/test_apple_fp4_matmul.mojo`,
+`max/tests/integration/nn/test_linear_nvfp4_apple_gpu.py`) are the templates for
+a CUDA W4A16 kernel test.
 
 ## Risks / sequencing
-1. Phase 1 (scp) — lowest risk; unblocks + gives the oracle.
-2. Phase 2 (1 kernel build) — establishes the build/deploy loop; delivers usable NVFP4 (VRAM win, ~bf16 speed). If the fused kernel is deferred, watch for constant-folding erasing the VRAM win.
-3. Phase 3 — **the hard part**: sm_120 block-scaled FP4 `mma.sync` intrinsics **do not exist in Mojo today and must be written**; then a full kernel + scale layout + hardware perf bring-up. Highest risk/reward. Phases 1–2 guarantee a correct, shippable fallback the whole time.
+1. Phase A (scp) — lowest risk; unblocks loading with the clean upstream
+   mechanism. Watch: `--model-override` may need Klein-executor plumbing.
+2. Phase C (1 kernel build + wheel bump) — the main task, but **de-risked**: the
+   dequant kernel is portable and already written+tested; there are two sibling
+   launchers (Apple, AMD) to copy; no new PTX. Watch: the NVIDIA dense-GEMM entry
+   point signature, and the July-3 wheel/kernel ABI lockstep on deploy.
+3. Phase D — optional perf; only if materialize→dense is DRAM-walled at deep K
+   (the upstream benchmark shows this happens at K≈18432). Native mma.sync is the
+   only genuinely hard, multi-week item and is now fully optional.
 
----
-
-## Deployment/box state at time of planning (for resume after compaction)
-- `max-serve` = `root@max-serve` (Proxmox LXC), GPU RTX PRO 6000 Blackwell **sm_120**, venv `/opt/max-serve/.venv` (py3.11), systemd `max-serve`, health `GET /health`.
-- Currently serving **bf16 FLUX.2-Klein-9B** with dynamic batching (`MODULAR_PIXEL_MAX_BATCH_SIZE`), healthy. NVFP4 override removed.
-- Combined NVFP4 repo exists at `/mnt/models/klein-9b-nvfp4-full` (21 GB, real copies: base bf16 components + NVFP4 transformer as `transformer/diffusion_pytorch_model.safetensors`).
-- Fork branches already pushed: `fix/flux2-vae-fused-conv-arch-gate`, `fix/zimage-turbo-load-and-output`, `fix/klein-num-images-batching`, `feat/klein-dynamic-batching`. The Phase-0 NVFP4 loading patches are deployed on the box but **uncommitted** in the fork.
+## Deployment/box state (resume anchor)
+- `max-serve` = `root@max-serve` (Proxmox LXC), GPU RTX PRO 6000 Blackwell
+  **sm_120**, venv `/opt/max-serve/.venv` (py3.11), systemd `max-serve`, health
+  `GET /health`. Currently serving bf16 Klein with dynamic batching.
+- Deployed wheel is the **July-2** nightly; bump to **July-3 (`dev2026070306`)**
+  before/at Phase C to match the rebased source for kernel builds.
+- Combined NVFP4 repo `/mnt/models/klein-9b-nvfp4-full` (21 GB) becomes
+  unnecessary once Phase A's `--model-override` path works (base repo + override
+  to the NVFP4 safetensors).
+- `.py` = live scp patch, no build. Kernel = `bazelw build` + artifact deploy +
+  ABI-matched wheel.
