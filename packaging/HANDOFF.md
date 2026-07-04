@@ -1,0 +1,70 @@
+# Deploy-team runbook — custom MAX (NVFP4 / sm_120) wheels
+
+Build, publish, and install our custom MAX as pip-installable **repacked wheels**.
+Background/why in `README.md`; this is the operational runbook.
+
+## What the artifact is
+Two wheels that overlay our changes onto the stock vendor MAX:
+- `max-<ver>+nvfp4sm120.<sha>-cp311-…manylinux_2_34_x86_64.whl` — Python delta
+  (VAE arch-gate fix, NVFP4 dispatch, Klein pipeline). Per-interpreter (cp311).
+- `max_mojo_libs-<ver>+nvfp4sm120.<sha>-py3-none-any.whl` — our compiled Mojo
+  kernels (`builtin_kernels`, `linalg`, `layout`, `builtin_primitives`).
+
+The closed vendor binaries (compiler, `_core.so`, `libmax.so`) are untouched and
+still come from `whl.modular.com`. The `+nvfp4sm120.<sha>` local tag pins the
+exact build and lets multiple versions coexist.
+
+## Current build (already available)
+`max-build:/opt/modular-custom/packaging/dist/` — base `26.5.0.dev2026070306`,
+git `45c629de`. Grab it: `scp -r root@max-build:/opt/modular-custom/packaging/dist/ .`
+
+## 1. Build a new set (build box with GPU + `./bazelw`, e.g. max-build)
+```bash
+cd /opt/modular-custom
+git fetch origin && git checkout feat/nvfp4-sm120-native-kernel
+git reset --hard origin/feat/nvfp4-sm120-native-kernel   # MUST be at HEAD:
+                                                          # a lagging HEAD drops
+                                                          # .py files from the diff
+packaging/build_overlay.sh                                # -> packaging/dist/
+```
+Rebuild when: the branch changes, OR the pinned nightly bumps
+(`MAX_PACKAGE_VERSION` in `bazel/mojo.MODULE.bazel`). ABI lockstep: the `.mojoc`
+must be built against the same nightly the vendor wheels are — `build_overlay.sh`
+reads that version automatically.
+
+## 2. Publish to the shared wheelhouse (from the RW side of `nvme-vg-shared`)
+`/mnt/packages` is read-only inside the LXC containers, so copy from the Proxmox
+host (or wherever the volume is mounted rw):
+```bash
+mkdir -p /mnt/packages/max-wheels
+cp /path/to/dist/*.whl /path/to/dist/MANIFEST.json /mnt/packages/max-wheels/
+# one-time: stage the CUDA runtime so every container gets cuBLAS the same way
+#   /mnt/packages/cuda-libs/  <- libcublas.so.12, libcudnn.so.*, libcusparse..., etc.
+```
+Keep old versions; the `+<sha>` tag keeps them distinct.
+
+## 3. Install into a container venv
+```bash
+V=26.5.0.dev2026070306; TAG=nvfp4sm120.45c629dec0
+pip install --find-links /mnt/packages/max-wheels \
+    "modular==$V" "max==$V+$TAG" "max_mojo_libs==$V+$TAG"
+```
+`modular==$V` pulls the closed base wheels + Python deps from `whl.modular.com`;
+`--find-links` makes pip prefer our repacked `max`/`max_mojo_libs`.
+(Equivalently: `packaging/install.sh <venv> /mnt/packages/max-wheels`.)
+
+**CUDA runtime:** `pip install modular` does NOT pull cuBLAS/cuDNN. The box must
+provide them — either they're already in the venv, or set
+`LD_LIBRARY_PATH=/mnt/packages/cuda-libs/...` (see the serve unit).
+
+## 4. Serve
+Fill placeholders in `max-serve-nvfp4.service`, install it, `systemctl enable
+--now max-serve-nvfp4`. Render via `POST /v1/responses`.
+
+## 5. Verify
+Fixed prompt+seed render should match the known-good clean image (red vase +
+yellow tulips). Failure modes:
+- **"unknown op … block.scaled.cuda"** → the `.mojoc` weren't picked up (check
+  `modular/lib/mojo/` has our `builtin_kernels.mojoc`).
+- **washed-out image** → the VAE fix `.py` didn't land (rebuild at branch HEAD).
+- **"symbol not found: cublasCreate_v2"** → no CUDA runtime on the loader path.
