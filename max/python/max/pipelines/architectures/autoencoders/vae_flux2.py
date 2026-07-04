@@ -20,7 +20,7 @@ without max.experimental dependencies.
 
 import math
 
-from max.driver import accelerator_api
+from max.driver import accelerator_api, accelerator_architecture_name
 from max.dtype import DType
 from max.graph import DeviceRef, TensorType, TensorValue, ops
 from max.nn.attention.mask_config import MHAMaskVariant
@@ -126,12 +126,24 @@ class ResnetBlock2D(Module):
         dispatches to SM100 (CUDA) or AMD 4-wave (MI355X) in-kernel
         residual paths.
         """
+        # The kernel only has SM100 and CDNA4 implementations, so gate on the
+        # actual arch -- NOT just the API. On other CUDA archs (e.g. sm_120,
+        # RTX PRO 6000 Blackwell) the op silently runs the SM100 kernel and
+        # produces a washed-out image; those must fall back to the standard
+        # conv2 + residual add.
+        try:
+            arch = accelerator_architecture_name()
+        except Exception:
+            return False
+        api = accelerator_api()
+        is_sm100 = api == "cuda" and arch.startswith("sm_10")
+        is_cdna4 = api in ("rocm", "hip") and "gfx95" in arch
         return (
             self.in_channels == self.out_channels
             and self.conv_shortcut is None
             and isinstance(self.conv2.device, DeviceRef)
             and self.conv2.device.is_gpu()
-            and accelerator_api() in ("cuda", "rocm", "hip")
+            and (is_sm100 or is_cdna4)
         )
 
     def __call__(
