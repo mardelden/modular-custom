@@ -44,12 +44,16 @@ from linalg.matmul.gpu.apple.fp4_dequant import enqueue_fp4_materialize
 
 def nvfp4_w4a16_matmul_cuda(
     c: TileTensor[mut=True, ...],
-    a: TileTensor,
-    b_packed: TileTensor,
-    b_scales: TileTensor,
+    a: TileTensor[DType.bfloat16, ...],
+    b_packed: TileTensor[DType.uint8, ...],
+    b_scales: TileTensor[DType.float8_e4m3fn, ...],
     ctx: DeviceContext,
 ) raises:
     """Weight-only NVFP4 matmul: materialize FP4 weight to bf16, then dense GEMM.
+
+    The activation, weight, and scale dtypes are pinned in the signature (bf16 /
+    uint8 packed E2M1 / fp8-e4m3 block scales) so they bind directly to
+    `enqueue_fp4_materialize`'s concretely-typed operands.
 
     Args:
         c: Output `[M, N]` (bfloat16 on the supported FLUX.2 path).
@@ -59,16 +63,6 @@ def nvfp4_w4a16_matmul_cuda(
         b_scales: FP8-E4M3 block scales `[N, K // 16]` (block size 16 along K).
         ctx: Device context.
     """
-    comptime a_type = a.dtype
-    comptime b_type = b_packed.dtype
-    comptime b_scales_type = b_scales.dtype
-
-    comptime assert a_type == DType.bfloat16, "activations must be bfloat16"
-    comptime assert b_type == DType.uint8, "weights must be uint8 (packed FP4)"
-    comptime assert (
-        b_scales_type == DType.float8_e4m3fn
-    ), "scales must be float8_e4m3fn"
-
     # The weight dims N (= c's free dim) and K (= a's contraction dim) are static
     # model dimensions; only M (tokens) is dynamic. Use the static extents for
     # the transient dense weight so the dense GEMM tiles like the AMD sibling.
