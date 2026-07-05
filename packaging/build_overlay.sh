@@ -59,7 +59,27 @@ MAX_ARGS=()
 for f in "${PYFILES[@]}"; do
   MAX_ARGS+=(--overlay "${f#max/python/}=$REPO/$f")
 done
-echo "== repacking max (${#PYFILES[@]} python files) =="
+
+# 4b. Bake precompiled Mojo kernel caches (max/**/__mojocache__/*.so). No vendor
+# wheel ships these — MAX JIT-compiles the framework ops (_core_mojo,
+# _kv_cache_ops, _distributed_ops) on first serve, which is a multi-minute cold
+# hang. Harvest them from a WARM reference venv (one that has already served the
+# model) and bake them in so fresh installs start warm. Deterministic
+# (hash-named) + tiny (~1.4 MB), so portable across boxes.
+WARM_VENV_SP="${WARM_VENV_SP:-/root/wheeltest/lib/python3.11/site-packages}"
+NCACHE=0
+if [ -d "$WARM_VENV_SP/max" ]; then
+  while IFS= read -r so; do
+    MAX_ARGS+=(--overlay "${so#"$WARM_VENV_SP"/}=$so")
+    NCACHE=$((NCACHE + 1))
+  done < <(find "$WARM_VENV_SP/max" -path '*__mojocache__*' -name '*.so' 2>/dev/null)
+fi
+if [ "$NCACHE" -eq 0 ]; then
+  echo "WARNING: no __mojocache__/*.so harvested (set WARM_VENV_SP to a venv that"
+  echo "         already served the model). Fresh installs will cold-JIT on first serve."
+fi
+
+echo "== repacking max (${#PYFILES[@]} python files + $NCACHE kernel caches) =="
 python3 packaging/repack_wheel.py --wheel "$MAX_WHL" --out "$OUT" --tag "$TAG" "${MAX_ARGS[@]}"
 
 # 5. Manifest (ABI-lockstep + provenance).
@@ -71,6 +91,7 @@ cat > "$OUT/MANIFEST.json" <<JSON
   "py_tag": "$PY_TAG",
   "platform": "$PLATFORM",
   "kernels": [$(printf '"%s",' "${!MOJOC[@]}" | sed 's/,$//')],
+  "kernel_caches_baked": $NCACHE,
   "python_files": ${#PYFILES[@]}
 }
 JSON

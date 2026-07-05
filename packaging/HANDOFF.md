@@ -25,12 +25,29 @@ git fetch origin && git checkout feat/nvfp4-sm120-native-kernel
 git reset --hard origin/feat/nvfp4-sm120-native-kernel   # MUST be at HEAD:
                                                           # a lagging HEAD drops
                                                           # .py files from the diff
-packaging/build_overlay.sh                                # -> packaging/dist/
+# Point WARM_VENV_SP at a venv that has ALREADY served the model, so the
+# precompiled kernel caches (max/**/__mojocache__/*.so) get baked in — otherwise
+# fresh installs cold-JIT the framework ops on first serve (a multi-minute hang).
+WARM_VENV_SP=/root/wheeltest-baked/lib/python3.11/site-packages \
+  packaging/build_overlay.sh                              # -> packaging/dist/
 ```
 Rebuild when: the branch changes, OR the pinned nightly bumps
 (`MAX_PACKAGE_VERSION` in `bazel/mojo.MODULE.bazel`). ABI lockstep: the `.mojoc`
 must be built against the same nightly the vendor wheels are — `build_overlay.sh`
 reads that version automatically.
+
+**Kernel caches (`__mojocache__`) — two-pass build.** No vendor wheel ships the
+JIT'd framework-op `.so`, so first serve on a cold box compiles them (`mojo build
+… --emit shared-lib`, minutes/op → effective hang). `build_overlay.sh` bakes them
+in by harvesting from `WARM_VENV_SP`. Flow for a fresh nightly:
+1. Build once (no warm venv yet — prints a "no __mojocache__ harvested" WARNING).
+2. `install.sh <venv> packaging/dist` and serve the model once (warms
+   `<venv>/…/site-packages/max/**/__mojocache__/*.so` — 4 files).
+3. Re-run `build_overlay.sh` with `WARM_VENV_SP=<that venv site-packages>` — now
+   the wheel bakes the 4 `.so`. The `.so` are hash-named + deterministic, so they
+   only need re-harvesting on a nightly bump.
+Verify: `unzip -l dist/max-*.whl | grep -c __mojocache__` should be **4**, and
+`MANIFEST.json` `kernel_caches_baked: 4`.
 
 ## 2. Publish to the shared wheelhouse (from the RW side of `nvme-vg-shared`)
 `/mnt/packages` is read-only inside the LXC containers, so copy from the Proxmox
