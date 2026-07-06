@@ -6,7 +6,8 @@ Background/why in `README.md`; this is the operational runbook.
 ## What the artifact is
 Two wheels that overlay our changes onto the stock vendor MAX:
 - `max-<ver>+nvfp4sm120.<sha>-cp311-…manylinux_2_34_x86_64.whl` — Python delta
-  (VAE arch-gate fix, NVFP4 dispatch, Klein pipeline). Per-interpreter (cp311).
+  (NVFP4 W4A4 dispatch + fused ws2, VAE unfused attention, PNG-encode speedup,
+  fp8-attention routing (gated off), Klein pipeline). Per-interpreter (cp311).
 - `max_mojo_libs-<ver>+nvfp4sm120.<sha>-py3-none-any.whl` — our compiled Mojo
   kernels (`builtin_kernels`, `linalg`, `layout`, `builtin_primitives`).
 
@@ -16,20 +17,26 @@ exact build and lets multiple versions coexist.
 
 ## Current build (already available)
 `max-build:/opt/modular-custom/packaging/dist/` — base `26.5.0.dev2026070306`,
-git `45c629de`. Grab it: `scp -r root@max-build:/opt/modular-custom/packaging/dist/ .`
+git `76b48d0827` (branch `feat/nvfp4-fp8-attention`), **kernel_caches_baked: 4**.
+Grab it: `scp -r root@max-build:/opt/modular-custom/packaging/dist/ .`
+Perf on this build: FLUX.2-Klein 1024² serve render **855 ms** (NVFP4, MODULAR_NVFP4_W4A4=1)
+vs **1501 ms** full-bf16 = 1.76× at ¼ weight memory; clean-venv validated byte-identical.
 
 ## 1. Build a new set (build box with GPU + `./bazelw`, e.g. max-build)
 ```bash
 cd /opt/modular-custom
-git fetch origin && git checkout feat/nvfp4-sm120-native-kernel
-git reset --hard origin/feat/nvfp4-sm120-native-kernel   # MUST be at HEAD:
+git fetch origin && git checkout feat/nvfp4-fp8-attention
+git reset --hard origin/feat/nvfp4-fp8-attention          # MUST be at HEAD:
                                                           # a lagging HEAD drops
                                                           # .py files from the diff
 # Point WARM_VENV_SP at a venv that has ALREADY served the model, so the
 # precompiled kernel caches (max/**/__mojocache__/*.so) get baked in — otherwise
 # fresh installs cold-JIT the framework ops on first serve (a multi-minute hang).
-WARM_VENV_SP=/root/wheeltest-baked/lib/python3.11/site-packages \
+WARM_VENV_SP=/root/wheeltest-w4a4-clean/lib/python3.11/site-packages \
   packaging/build_overlay.sh                              # -> packaging/dist/
+# (WARM_VENV_SP = a venv that has ALREADY installed THIS wheel and served once.
+#  The 76b48d0827 build used /root/wheeltest-w4a4-clean, warmed by
+#  /root/wheel_validate.sh. A stale-SHA warm venv bakes the WRONG kernel caches.)
 ```
 Rebuild when: the branch changes, OR the pinned nightly bumps
 (`MAX_PACKAGE_VERSION` in `bazel/mojo.MODULE.bazel`). ABI lockstep: the `.mojoc`
@@ -62,7 +69,7 @@ Keep old versions; the `+<sha>` tag keeps them distinct.
 
 ## 3. Install into a container venv
 ```bash
-V=26.5.0.dev2026070306; TAG=nvfp4sm120.45c629dec0
+V=26.5.0.dev2026070306; TAG=nvfp4sm120.76b48d0827
 pip install --find-links /mnt/packages/max-wheels \
     "modular==$V" "max==$V+$TAG" "max_mojo_libs==$V+$TAG"
 ```
