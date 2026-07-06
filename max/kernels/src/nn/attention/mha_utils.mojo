@@ -199,6 +199,11 @@ struct MHAConfig[dtype: DType](TrivialRegisterPassable, Writable):
 
     def q_smem_size(self, fa3: Bool = False, persistent: Bool = False) -> Int:
         q_size = self.block_m() * self.padded_depth
+        # fp8 (e4m3) inputs reuse the q_smem region as the bf16 output
+        # accumulator in the epilogue (2 bytes/elem vs 1). Reserve double so the
+        # bf16 store stays inside the q region instead of overrunning k_smem.
+        if self.dtype.is_float8():
+            q_size = 2 * self.block_m() * self.padded_depth
         num_q = 2 if fa3 and persistent else 1
         return num_q * q_size
 
@@ -253,8 +258,28 @@ struct MHAConfig[dtype: DType](TrivialRegisterPassable, Writable):
                 + self.warp_scratch_smem_size()
             )
 
-        if self.num_warps_n() > 1 or has_amd_gpu_accelerator():
+        # fp8 stages P to smem even with num_warps_n == 1 (its P·V MMA reads
+        # e4m3 P from smem; the bf16 single-warp register-reuse trick relies on
+        # a layout compatibility that fp8's 4-per-u32 packing breaks).
+        if (
+            self.num_warps_n() > 1
+            or has_amd_gpu_accelerator()
+            or self.dtype.is_float8()
+        ):
             num_smem_elements += self.p_smem_size()
+
+        # warp_scratch holds f32 (accum) entries but num_smem_elements is
+        # counted in dtype-sized units, so for sub-4-byte dtypes the scratch
+        # is under-counted (4x for fp8, 2x for bf16/half) and the kernel's
+        # f32 scratch writes run past the dynamic-smem allocation
+        # (CUDA_ERROR_ILLEGAL_ADDRESS). Add the missing dtype-units per entry.
+        # No-op when num_warps_n == 1 (scratch size 0, all current bf16
+        # configs) and for fp32 (exact as-is).
+        comptime dtype_size = size_of[Self.dtype]()
+        comptime if dtype_size < size_of[DType.float32]():
+            num_smem_elements += (
+                size_of[DType.float32]() // dtype_size - 1
+            ) * self.warp_scratch_smem_size()
 
         num_smem_bytes = size_of[self.dtype]() * num_smem_elements
         if sm_90_fa3:
@@ -361,11 +386,26 @@ struct MHAConfig[dtype: DType](TrivialRegisterPassable, Writable):
             )
             var bk_arch_factor = 2 if num_pipeline_stages <= 2 else 1
             var bk_type_factor = 1 if Self.dtype == DType.float32 else 2
+            # fp8 (e4m3) on NVIDIA uses the m16n8k32 MMA (K=32 vs bf16's 16),
+            # so BK must be 64 to keep num_k_mmas = BK/MMA_K an even multiple
+            # (the multistage MMA requires num_k_mmas % (2*k_group_size) == 0).
+            # BK=64 in turn requires num_pipeline_stages=2 (set below): the
+            # kernel is only correct when BK x stages ~ depth (bf16 control
+            # matrix: BK64/stages4 -> wrong numbers, BK64/stages2 -> exact).
             self.BK = BK.or_else(
-                16 * bk_arch_factor * bk_type_factor
+                64 if Self.dtype.is_float8() else (
+                    16 * bk_arch_factor * bk_type_factor
+                )
             ) if has_nvidia_gpu_accelerator() else BK.or_else(
                 64 if Self.dtype.is_float8() else 32
             )
+            if Self.dtype.is_float8() and has_nvidia_gpu_accelerator():
+                self.num_pipeline_stages = 2
+            # fp8 keeps WN = BN (num_warps_n == 1) -- the correct, production
+            # single-warp geometry (the multi-warp WN<BN path is untested at
+            # depth 128 and numerically wrong even for bf16). fp8 instead
+            # routes P through the smem-staging path (see mha.mojo) so the
+            # f32->e4m3 P cast + ×256 lift happen element-wise.
             self.WN = WN.or_else(
                 32 if Self.dtype == DType.float32 else self.num_keys_per_block
             )
@@ -490,9 +530,15 @@ def _copy_frag_to_smem_nvidia[
                     simd_width
                 ) + offset_BMxBK % OffsetType(simd_width)
                 # E.g. fp32x2 -> bf16x2 for bf16 mma.
-                var vec = p_reg_vecs[n_mma * num_m_mmas + m_mma, i].cast[
-                    p_smem_tile.dtype
-                ]()
+                # fp8 (e4m3) P·V path: lift P by 256 before the e4m3 cast so
+                # the small softmax probabilities clear e4m3's subnormal floor
+                # (mirrors the datacenter sm100 kernel's P scaling). The
+                # mha_single_batch epilogue divides the output by the same 256.
+                # The branch is comptime-elided for the bf16 path (unchanged).
+                var pv = p_reg_vecs[n_mma * num_m_mmas + m_mma, i]
+                comptime if p_smem_tile.dtype.is_float8():
+                    pv = pv * Scalar[pv.dtype](256.0)
+                var vec = pv.cast[p_smem_tile.dtype]()
                 # Grep the right BMxBK tile and store the casted vec.
                 var tile_BMxBK = p_smem_iter.next_unsafe(
                     p_smem_iter.linear_uint_type(

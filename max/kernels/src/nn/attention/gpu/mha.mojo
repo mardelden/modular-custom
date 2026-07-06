@@ -610,7 +610,14 @@ def flash_attention_dispatch[
     comptime group = config.num_heads // kv_num_heads
 
     # K V smem is only separate for GPUs with shared memory greater or equal to A100's.
-    comptime is_shared_kv = ctx.default_device_info.shared_memory_per_multiprocessor < A100.shared_memory_per_multiprocessor
+    # fp8 (e4m3) forces the non-pipelined `mha_single_batch`: its element-wise
+    # P->smem store casts f32->e4m3 (the pipelined kernel's vectorized copy only
+    # supports f32->half), and fp8 tiles are half-size so they fit sm_120's smem
+    # without the pipelined K/V staging. bf16/half is unaffected.
+    comptime is_shared_kv = (
+        ctx.default_device_info.shared_memory_per_multiprocessor
+        < A100.shared_memory_per_multiprocessor
+    ) and not q.dtype.is_float8()
 
     comptime assert depth == Int(q.layout.shape[q.rank - 1])
     comptime assert num_heads == Int(q.layout.shape[q.rank - 2])
@@ -2824,7 +2831,11 @@ def mha_single_batch[
 
         async_copy_commit_group()
 
-        comptime if num_warps_n > 1:
+        # fp8 always stages P to smem (num_warps_n == 1 for fp8, but its P·V
+        # MMA needs e4m3 P in smem -- the register-reuse `else` branch only
+        # casts f32->bf16). The ×256 lift + f32->e4m3 cast live in
+        # `_copy_frag_to_smem_nvidia`.
+        comptime if num_warps_n > 1 or q_type.is_float8():
             # Pack the per-thread fragments in shared memory for 2nd mma.
             _copy_frag_to_smem[
                 BM,
@@ -2901,6 +2912,15 @@ def mha_single_batch[
         var rowsum_inv0 = recip(rowsum[2 * m_mma])
         var rowsum_inv1 = recip(rowsum[2 * m_mma + 1])
 
+        # fp8 (e4m3) P·V path: P was lifted by 256 before the e4m3 cast in
+        # `_copy_frag_to_smem_nvidia` (to clear the e4m3 subnormal floor);
+        # undo it here so the output is correctly scaled. rowsum is the
+        # UNlifted softmax denominator, so this is a plain extra 1/256.
+        # comptime-elided (no-op) for the bf16 path.
+        comptime if v_t.dtype.is_float8():
+            rowsum_inv0 = rowsum_inv0 * type_of(rowsum_inv0)(1.0 / 256.0)
+            rowsum_inv1 = rowsum_inv1 * type_of(rowsum_inv1)(1.0 / 256.0)
+
         comptime for n_mma in range(num_n_mmas):
             comptime for i in range(p_frag_size // 2):
                 output_reg_tile[n_mma * num_m_mmas + m_mma, i] *= rowsum_inv0
@@ -2934,6 +2954,11 @@ def mha_single_batch[
 
     # Write to global memory.
     comptime if output_type.is_half_float():
+        # The output store vectorizes by the OUTPUT dtype width (bf16 -> 8), not
+        # the input-derived `simd_size` (e4m3 -> 16), so the fp8 path issues the
+        # same 16B bf16 stores the bf16 path does. Equal to `simd_size` when the
+        # inputs are bf16, so the bf16 path is unchanged.
+        comptime out_simd_size = simd_width_of[output_type]()
         comptime swizzle = make_swizzle[
             num_rows=MMA_M // 2, row_size=WN, access_size=MMA_N
         ]()
@@ -2962,13 +2987,13 @@ def mha_single_batch[
         # vector and stored using 16B store instruction.
         copy_sram_to_dram[
             thread_layout=Layout.row_major(
-                num_threads * simd_size // depth,
-                depth // simd_size,
+                num_threads * out_simd_size // depth,
+                depth // out_simd_size,
             ),
             swizzle=swizzle,
         ](
-            output_gmem_tile.vectorize[1, simd_size](),
-            accum_smem_tile.vectorize[1, simd_size](),
+            output_gmem_tile.vectorize[1, out_simd_size](),
+            accum_smem_tile.vectorize[1, out_simd_size](),
         )
     else:
         copy_local_to_dram[dst_thread_layout=Layout.row_major(8, 4)](

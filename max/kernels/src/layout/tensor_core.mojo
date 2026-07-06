@@ -1090,12 +1090,18 @@ struct TensorCore[
                     var mma_tile = warp_tile.tile[Self.shape[2], Self.shape[1]](
                         mma_tile_coord_k, i
                     )
+                    # distribute[col_major(4, 8)] of the [4,1]-vectorized
+                    # (K=32, N=8) tile gives each lane a (2, 1) fragment:
+                    # frags[0, 0] = k rows 4*(lane%4)..+3 (mma reg b0) and
+                    # frags[1, 0] = the same +16 (reg b1), n = lane//4 --
+                    # the m16n8k32 8-bit B layout. (frags[0, 1] is OOB: the
+                    # fragment has a single column.)
                     var frags = mma_tile.vectorize[4, 1]().distribute[
                         Layout.col_major(4, 8)
                     ](lane_id())
                     fragments[i, 0] = rebind[frag_type](
                         rebind[SIMD[warp_tile.dtype, 4]](frags[0, 0]).join(
-                            rebind[SIMD[warp_tile.dtype, 4]](frags[0, 1])
+                            rebind[SIMD[warp_tile.dtype, 4]](frags[1, 0])
                         ),
                     )
 
