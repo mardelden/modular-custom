@@ -24,6 +24,7 @@ from max.graph import (
     BufferValue,
     DeviceRef,
     Dim,
+    Graph,
     ShardingStrategy,
     TensorValue,
     TensorValueLike,
@@ -558,7 +559,26 @@ def linear(
             m_dim: Dim = Dim(1)
             for d in leading_dims:
                 m_dim = m_dim * d
-            x = ops.reshape(x, [m_dim, x.shape[-1]])
+            # Memoize the flatten per source tensor on the current graph so
+            # sibling quantized Linears consuming the SAME activation (e.g.
+            # the q/k/v projections) receive the SAME rank-2 TensorValue.
+            # That identity is what lets the W4A4 activation-quant cache in
+            # `_cuda_w4a4_matmul` quantize a shared activation once instead
+            # of once per consumer. Keyed by object identity (strong ref held
+            # in the entry, so ids cannot be recycled).
+            _graph = Graph.current
+            _fc = getattr(_graph, "_quant_flatten_cache", None)
+            if _fc is None:
+                _fc = {}
+                _graph._quant_flatten_cache = _fc
+            _fk = (id(x), str(m_dim), str(x.shape[-1]))
+            _hit = _fc.get(_fk)
+            if _hit is not None and _hit[0] is x:
+                x = _hit[1]
+            else:
+                _x_src = x
+                x = ops.reshape(x, [m_dim, x.shape[-1]])
+                _fc[_fk] = (_x_src, x)
 
         res = quantized_matmul(
             x,

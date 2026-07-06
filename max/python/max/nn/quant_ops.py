@@ -11,12 +11,16 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+import os
+
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, ops
 
 from .kernels import (
     _apple_weight_only_block_scaled_matmul,
+    _cuda_w4a4_matmul,
     _cuda_weight_only_block_scaled_matmul,
+    _cuda_weight_only_block_scaled_matmul_fused,
     _fused_qkv_index_ragged_matmul_scaled_mxfp8,
     _fused_qkv_ragged_matmul_scaled_float4,
     _fused_qkv_ragged_matmul_scaled_float8,
@@ -150,12 +154,41 @@ def _matmul_float4(
                 "CUDA W4A16 path requires deinterleaved rank-2 weight scales "
                 "(scales_pre_interleaved=False)"
             )
-        res = _cuda_weight_only_block_scaled_matmul(
-            x,
-            weight,
-            weight_scale,
-            out_type=DType.bfloat16,
-        )
+        # Opt into the FUSED kernel (decode packed FP4 -> bf16 in SMEM inside
+        # the GEMM mainloop; the weight is read 4-bit from DRAM and never
+        # materialized) via MODULAR_NVFP4_FUSED=1. Default keeps the Phase C
+        # materialize->dense helper. Both produce the identical bf16 result and
+        # take the identical weight_scale_2 post-matmul fold below.
+        if os.environ.get("MODULAR_NVFP4_W4A4") == "1":
+            # Native FP4xFP4: quantize the activation to fp4 too and run the
+            # sm_120a block-scaled FP4 tensor-core MMA. weight_scale_2 is folded
+            # INSIDE the GEMM epilogue (double-rounded -> byte-identical to the
+            # old post-matmul graph fold; saves one cast*mul*cast elementwise
+            # kernel per matmul), so return directly -- no fold below. (The
+            # activation per-tensor scale cancels into its dynamic per-block
+            # scale.) W4A4 changes numerics (fp4 activations) -- accuracy-gated,
+            # off by default.
+            return _cuda_w4a4_matmul(
+                x,
+                weight,
+                weight_scale,
+                weight_scale_2,
+                out_type=DType.bfloat16,
+            )
+        elif os.environ.get("MODULAR_NVFP4_FUSED") == "1":
+            res = _cuda_weight_only_block_scaled_matmul_fused(
+                x,
+                weight,
+                weight_scale,
+                out_type=DType.bfloat16,
+            )
+        else:
+            res = _cuda_weight_only_block_scaled_matmul(
+                x,
+                weight,
+                weight_scale,
+                out_type=DType.bfloat16,
+            )
         return (res.cast(DType.float32) * weight_scale_2.to(res.device)).cast(
             DType.bfloat16
         )

@@ -17,6 +17,8 @@ from __future__ import annotations
 from collections.abc import MutableSequence
 from typing import Any
 
+import os
+
 import numpy as np
 from max._core.dialects import mo
 from max.driver import accelerator_api, accelerator_architecture_name
@@ -2713,6 +2715,7 @@ def flash_attention_gpu(
     scale: float,
     local_window_size: int = -1,
     valid_length: TensorValue | None = None,
+    out_dtype: DType | None = None,
 ) -> TensorValue:
     """Computes flash attention using GPU-optimized kernel.
 
@@ -2726,6 +2729,9 @@ def flash_attention_gpu(
         valid_length: Optional tensor of shape [batch] with dtype uint32.
             When provided, uses the padded kernel variant that respects
             the valid sequence lengths for each batch element.
+        out_dtype: Optional output dtype. Defaults to ``q.dtype``. Set to
+            ``bfloat16`` for the fp8 (e4m3) attention path, where Q/K/V are
+            e4m3 but the accumulation/output is bf16.
 
     Returns:
         Output tensor of shape [batch, seq_len, num_heads, head_dim]
@@ -2785,7 +2791,11 @@ def flash_attention_gpu(
     return ops.custom(
         op_name,
         values=values,
-        out_types=[TensorType(dtype=q.dtype, shape=q.shape, device=q.device)],
+        out_types=[
+            TensorType(
+                dtype=out_dtype or q.dtype, shape=q.shape, device=q.device
+            )
+        ],
         parameters=parameters,
         device=q.device,
     )[0].tensor
@@ -6382,6 +6392,180 @@ def _cuda_weight_only_block_scaled_matmul(
         "mo.matmul.weight.only.block.scaled.cuda",
         device=a.device,
         values=[a, b, b_scales],
+        out_types=[
+            TensorType(
+                dtype=out_type, shape=[a.shape[0], b.shape[0]], device=a.device
+            )
+        ],
+    )[0].tensor
+
+    return result
+
+
+def _cuda_weight_only_block_scaled_matmul_fused(
+    a: TensorValue,
+    b: TensorValue,
+    b_scales: TensorValue,
+    out_type: DType = DType.bfloat16,
+) -> TensorValue:
+    """NVIDIA weight-only NVFP4 (W4A16) FUSED matmul: ``out = a @ dequant(b).T``.
+
+    The FUSED sibling of :func:`_cuda_weight_only_block_scaled_matmul`: identical
+    operand contract and numeric result, but the kernel decodes the packed FP4
+    weight to bf16 in shared memory *inside* the GEMM mainloop (the weight is
+    read 4-bit from DRAM and never materialized to a transient dense bf16
+    buffer). Same W4A16 contract: ``a`` stays ``bfloat16`` and the weight block
+    scales are plain rank-2 ``[N, K // 16]``. The NVFP4 per-tensor
+    ``weight_scale_2`` scalar is *not* an argument here -- the caller applies it
+    as a post-matmul graph-level multiply.
+
+    Args:
+        a: The bf16 activation, shape ``[M, K]``.
+        b: The packed FP4 weight, ``uint8`` shape ``[N, K // 2]`` (two ``e2m1``
+            nibbles per byte, low nibble first).
+        b_scales: The FP8-E4M3 block scales, ``float8_e4m3fn`` shape
+            ``[N, K // 16]`` (block size 16 along K).
+        out_type: The output dtype (``bfloat16``, ``float16``, or ``float32``).
+
+    Returns:
+        The matmul result, shape ``[M, N]``.
+    """
+    if a.rank != 2 or b.rank != 2:
+        raise ValueError("Both a and b must be rank 2 tensors")
+    if b_scales.rank != 2:
+        raise ValueError("b_scales must be a rank 2 tensor")
+    if a.dtype != DType.bfloat16:
+        raise ValueError(f"activation a must be bfloat16, got {a.dtype}")
+    if b.dtype != DType.uint8:
+        raise ValueError(
+            f"weight b must be uint8 (fp4-e2m1fnX2), got {b.dtype}"
+        )
+    if b_scales.dtype != DType.float8_e4m3fn:
+        raise ValueError(
+            f"b_scales must be float8_e4m3fn, got {b_scales.dtype}"
+        )
+
+    result = ops.custom(
+        "mo.matmul.weight.only.block.scaled.cuda.fused",
+        device=a.device,
+        values=[a, b, b_scales],
+        out_types=[
+            TensorType(
+                dtype=out_type, shape=[a.shape[0], b.shape[0]], device=a.device
+            )
+        ],
+    )[0].tensor
+
+    return result
+
+
+def _cuda_w4a4_matmul(
+    a: TensorValue,
+    b: TensorValue,
+    b_scales: TensorValue,
+    weight_scale_2: TensorValue,
+    out_type: DType = DType.bfloat16,
+) -> TensorValue:
+    """NVIDIA NATIVE NVFP4 W4A4 matmul: fp4 activation x fp4 weight (HW block scale).
+
+    Unlike the W4A16 helpers (which keep ``a`` bf16 and decode the fp4 weight to
+    bf16), this quantizes the bf16 activation to fp4 + fp8 block scales inside the
+    launcher and runs the native sm_120a block-scaled FP4 tensor-core MMA
+    (``nvfp4_w4a4_matmul_cuda``). Same operand contract as
+    :func:`_cuda_weight_only_block_scaled_matmul`. The per-tensor
+    ``weight_scale_2`` scalar is folded INSIDE the GEMM epilogue (with the same
+    double rounding as the old graph-side post-matmul fold, so the result is
+    byte-identical) -- callers must NOT apply it again. (The activation
+    per-tensor scale cancels into the dynamic per-block activation scale.)
+
+    Args:
+        a: The bf16 activation, shape ``[M, K]``.
+        b: The packed FP4 weight, ``uint8`` shape ``[N, K // 2]``.
+        b_scales: The FP8-E4M3 weight block scales, shape ``[N, K // 16]``.
+        weight_scale_2: The per-tensor scale (1 element); folded in-kernel.
+        out_type: The output dtype.
+
+    Returns:
+        The matmul result, shape ``[M, N]`` (weight_scale_2 already applied).
+    """
+    if a.rank != 2 or b.rank != 2:
+        raise ValueError("Both a and b must be rank 2 tensors")
+    if b_scales.rank != 2:
+        raise ValueError("b_scales must be a rank 2 tensor")
+    if a.dtype != DType.bfloat16:
+        raise ValueError(f"activation a must be bfloat16, got {a.dtype}")
+    if b.dtype != DType.uint8:
+        raise ValueError(
+            f"weight b must be uint8 (fp4-e2m1fnX2), got {b.dtype}"
+        )
+    if b_scales.dtype != DType.float8_e4m3fn:
+        raise ValueError(
+            f"b_scales must be float8_e4m3fn, got {b_scales.dtype}"
+        )
+
+    # Kernel expects a rank-1 [1] f32 on the GEMM's device.
+    s2 = weight_scale_2.cast(DType.float32).reshape([1]).to(a.device)
+
+    # MODULAR_NVFP4_FUSEDQ=1: single all-in-one op whose kernel quantizes the
+    # activation inside the GEMM prologue (bit-identical, one launch, no
+    # packed-A DRAM round-trip). The Mojo op routes on the same env var.
+    if os.environ.get("MODULAR_NVFP4_FUSEDQ") == "1":
+        return ops.custom(
+            "mo.matmul.block.scaled.cuda.w4a4",
+            device=a.device,
+            values=[a, b, b_scales, s2],
+            out_types=[
+                TensorType(
+                    dtype=out_type,
+                    shape=[a.shape[0], b.shape[0]],
+                    device=a.device,
+                )
+            ],
+        )[0].tensor
+
+    # Quantize the activation as its own op, memoized per activation
+    # TensorValue on the current graph: sibling Linears consuming the SAME
+    # rank-2 activation (q/k/v projections, per-block modulation -- see the
+    # flatten memo in nn/linear.py that preserves that identity) share ONE
+    # quant kernel instead of re-quantizing per consumer. Keyed by object
+    # identity with a strong ref held in the entry (ids cannot be recycled).
+    # The packed shape [M, K//2] / scale shape [M, K//16] are taken from the
+    # weight operands (b: [N, K//2], b_scales: [N, K//16]).
+    graph = Graph.current
+    quant_cache = getattr(graph, "_nvfp4_act_quant_cache", None)
+    if quant_cache is None:
+        quant_cache = {}
+        graph._nvfp4_act_quant_cache = quant_cache
+    cache_key = (id(a), str(b.shape[1]), str(b_scales.shape[1]))
+    cached = quant_cache.get(cache_key)
+    if cached is not None and cached[0] is a:
+        a_packed, a_scales = cached[1], cached[2]
+    else:
+        quant_out = ops.custom(
+            "mo.quant.act.fp4.cuda",
+            device=a.device,
+            values=[a],
+            out_types=[
+                TensorType(
+                    dtype=DType.uint8,
+                    shape=[a.shape[0], b.shape[1]],
+                    device=a.device,
+                ),
+                TensorType(
+                    dtype=DType.float8_e4m3fn,
+                    shape=[a.shape[0], b_scales.shape[1]],
+                    device=a.device,
+                ),
+            ],
+        )
+        a_packed = quant_out[0].tensor
+        a_scales = quant_out[1].tensor
+        quant_cache[cache_key] = (a, a_packed, a_scales)
+
+    result = ops.custom(
+        "mo.matmul.block.scaled.cuda.w4a4.prequant",
+        device=a.device,
+        values=[a_packed, a_scales, b, b_scales, s2],
         out_types=[
             TensorType(
                 dtype=out_type, shape=[a.shape[0], b.shape[0]], device=a.device

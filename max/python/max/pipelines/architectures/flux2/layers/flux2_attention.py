@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Sequence
 
 from max.dtype import DType
@@ -84,6 +85,87 @@ def _apply_flux2_qk_rope(
         ops.reshape(query_out, [batch_size, seq_len, num_heads, head_dim]),
         ops.reshape(key_out, [batch_size, seq_len, num_heads, head_dim]),
     )
+
+
+def _fake_quant_fp8(x: TensorValue) -> TensorValue:
+    """Round-trips a tensor through ``float8_e4m3fn`` to simulate fp8 storage.
+
+    Casts to e4m3 and back to the original dtype so downstream math sees the
+    fp8 quantization error without any kernel change. Used only for the
+    ``MODULAR_FP8_ATTN_SIM`` quality experiment.
+    """
+    return ops.cast(ops.cast(x, DType.float8_e4m3fn), x.dtype)
+
+
+def _fp8_attention(
+    query: TensorValue,
+    key: TensorValue,
+    value: TensorValue,
+    scale: float,
+) -> TensorValue:
+    """Runs attention, optionally simulating fp8 numerics for a quality test.
+
+    Inputs are ``[B, S, H, D]`` (post-RoPE); returns ``[B, S, H, D]`` exactly
+    like ``flash_attention_gpu``. The env var ``MODULAR_FP8_ATTN_SIM`` selects:
+
+    - unset / ``0`` / ``off``: the normal fused bf16 flash attention (no change).
+    - ``qk``: fake-quant Q, K to e4m3 then the fused bf16 kernel (fp8 QK^T only).
+    - ``qkv``: fake-quant Q, K, V to e4m3 then the fused bf16 kernel.
+    - ``full``: unfused ``softmax(scale * Qq @ Kq^T) @ Vq`` with P *also*
+      fake-quanted (x256 subnormal lift, mirroring the sm100 e4m3 P kernel).
+      This is the realistic quality bound for a fully-fp8 attention kernel.
+
+    ``full`` materializes an ``[B, H, S, S]`` scores tensor and is slow -- it is
+    for measuring quality only, never for timing.
+
+    Separately, ``MODULAR_NVFP4_FP8_ATTN=1`` selects the REAL fused fp8 kernel:
+    Q/K/V are cast to e4m3 and the sm_120 FA2 kernel runs the fp8 Q·K^T + fp8
+    P·V MMAs (bf16 output). This is the production path the sim above predicts.
+    """
+    if os.environ.get("MODULAR_NVFP4_FP8_ATTN") == "1":
+        q8 = ops.cast(query, DType.float8_e4m3fn)
+        k8 = ops.cast(key, DType.float8_e4m3fn)
+        v8 = ops.cast(value, DType.float8_e4m3fn)
+        return flash_attention_gpu(
+            q8,
+            k8,
+            v8,
+            mask_variant=MHAMaskVariant.NULL_MASK,
+            scale=scale,
+            out_dtype=query.dtype,
+        )
+
+    mode = os.environ.get("MODULAR_FP8_ATTN_SIM", "").strip().lower()
+
+    if mode in ("qk", "qkv", "full"):
+        query = _fake_quant_fp8(query)
+        key = _fake_quant_fp8(key)
+        if mode in ("qkv", "full"):
+            value = _fake_quant_fp8(value)
+
+    if mode != "full":
+        return flash_attention_gpu(
+            query,
+            key,
+            value,
+            mask_variant=MHAMaskVariant.NULL_MASK,
+            scale=scale,
+        )
+
+    # Unfused reference so the softmax probabilities P can be fake-quanted too.
+    # [B, S, H, D] -> [B, H, S, D] (heads become the matmul batch dim).
+    q = ops.transpose(query, 1, 2)
+    k = ops.transpose(key, 1, 2)
+    v = ops.transpose(value, 1, 2)
+    # scores [B, H, S, S]; softmax in f32 to match the kernel's f32 accumulator.
+    scores = ops.cast(q @ ops.transpose(k, 2, 3), DType.float32) * scale
+    probs = ops.softmax(scores)
+    # Fake-quant P with the x256 lift the real e4m3 kernel uses to pull small
+    # probabilities out of the e4m3 subnormal floor (max e4m3 is 448 > 256).
+    probs = ops.cast(probs * 256.0, DType.float8_e4m3fn)
+    probs = ops.cast(probs, value.dtype) * (1.0 / 256.0)
+    out = probs @ v  # [B, H, S, D]
+    return ops.transpose(out, 1, 2)  # -> [B, S, H, D]
 
 
 class Flux2SwiGLU(Module):
@@ -696,13 +778,7 @@ class Flux2Attention(Module, Shardable):
 
         # Scaled dot-product attention
         scale = 1.0 / (self.head_dim**0.5)
-        hidden_states = flash_attention_gpu(
-            query,
-            key,
-            value,
-            mask_variant=MHAMaskVariant.NULL_MASK,
-            scale=scale,
-        )
+        hidden_states = _fp8_attention(query, key, value, scale)
 
         # hidden_states = F.flatten(hidden_states, 2, 3)
         # Reshape from [B, S, num_heads, head_dim] to [B, S, num_heads * head_dim]
@@ -985,12 +1061,8 @@ class Flux2ParallelSelfAttention(Module, Shardable):
         if image_rotary_emb is not None:
             cos, sin = image_rotary_emb
             query, key = _apply_flux2_qk_rope(query, key, cos, sin)
-        hidden_states = flash_attention_gpu(
-            query,
-            key,
-            value,
-            mask_variant=MHAMaskVariant.NULL_MASK,
-            scale=1.0 / (self.head_dim**0.5),
+        hidden_states = _fp8_attention(
+            query, key, value, 1.0 / (self.head_dim**0.5)
         )
         # hidden_states = F.flatten(hidden_states, 2, 3)
         # Reshape from [B, S, num_heads, head_dim] to [B, S, num_heads * head_dim]

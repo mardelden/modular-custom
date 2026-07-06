@@ -50,6 +50,11 @@ from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph, Shape, TensorType, TensorValue, ops
 from max.graph.weights import WeightData
 from max.nn import Linear
+from max.nn.kernels import (
+    _cuda_w4a4_matmul,
+    _cuda_weight_only_block_scaled_matmul,
+    _cuda_weight_only_block_scaled_matmul_fused,
+)
 from max.nn.quant_config import (
     InputScaleSpec,
     QuantConfig,
@@ -277,4 +282,223 @@ def test_linear_nvfp4_cuda() -> None:
     assert np.all(np.abs(got - ref) <= atol), (
         f"CUDA NVFP4 Linear mismatch vs bf16 dequant reference: "
         f"max_err={max_err}"
+    )
+
+
+def test_linear_nvfp4_cuda_fused_matches_materialize() -> None:
+    """Fused NVFP4 op == materialize NVFP4 op on identical inputs.
+
+    Builds one graph with two branches over the *same* activation, packed FP4
+    weight, and FP8 block scales: the Phase C materialize->dense op
+    (``mo.matmul.weight.only.block.scaled.cuda``, the correctness ORACLE) and the
+    fused decode-in-SMEM op (``...cuda.fused``). Both dequantize the weight to the
+    identical bf16 values and feed the identical bf16 tensor-core MMA, so they
+    must agree to bf16-MMA tolerance (only the f32 accumulation order differs).
+    """
+    _skip_if_not_cuda_w4a16()
+
+    rng = np.random.default_rng(1)
+    # FLUX.2 transformer block dim: N=out, K=in. K must be a multiple of 16.
+    M, N, K = 8, 256, 512
+
+    device = Accelerator(0)
+    device_ref = DeviceRef(device.label, device.id)
+
+    # Random 4-bit codes (full 0..15 range) + fp8-exact positive block scales.
+    nibbles = rng.integers(0, 16, size=(N, K), dtype=np.uint8)
+    packed = _pack_fp4_weight(nibbles)  # [N, K//2] uint8
+    scale_k = K // _SF_VECTOR_SIZE
+    # Scales in {0.5, 1.0, 1.5, 2.0} -> exactly fp8-e4m3 representable.
+    scales_fp32 = rng.integers(1, 5, size=(N, scale_k)).astype(
+        np.float32
+    ) * np.float32(0.5)
+    scales_fp8_bytes = _fp32_to_fp8_bytes(scales_fp32, device, device_ref)
+
+    x_fp32 = (rng.standard_normal((M, K)) * 0.1).astype(np.float32)
+
+    session = InferenceSession(devices=[device])
+    with Graph(
+        "NVFP4_CUDA_Fused_vs_Materialize",
+        input_types=[
+            TensorType(DType.float32, (M, K), device=device_ref),
+            TensorType(DType.uint8, (N, K // 2), device=device_ref),
+            TensorType(DType.float8_e4m3fn, (N, scale_k), device=device_ref),
+        ],
+    ) as graph:
+        x_in, packed_in, scales_in = graph.inputs
+        assert isinstance(x_in, TensorValue)
+        assert isinstance(packed_in, TensorValue)
+        assert isinstance(scales_in, TensorValue)
+        # Cast activation to bf16 in-graph (matches a real bf16 activation).
+        x_bf16 = ops.cast(x_in, DType.bfloat16)
+
+        # Oracle: the Phase C materialize->dense NVFP4 op.
+        out_mat = _cuda_weight_only_block_scaled_matmul(
+            x_bf16, packed_in, scales_in, out_type=DType.bfloat16
+        )
+        # Path under test: the fused decode-in-SMEM NVFP4 op.
+        out_fused = _cuda_weight_only_block_scaled_matmul_fused(
+            x_bf16, packed_in, scales_in, out_type=DType.bfloat16
+        )
+
+        graph.output(
+            ops.cast(out_mat, DType.float32),
+            ops.cast(out_fused, DType.float32),
+        )
+
+    compiled = session.load(graph)
+
+    x_dev = Buffer.from_numpy(x_fp32).to(device)
+    packed_dev = Buffer.from_numpy(packed).to(device)
+    scales_dev = (
+        Buffer.from_numpy(scales_fp8_bytes)
+        .view(DType.float8_e4m3fn, (N, scale_k))
+        .to(device)
+    )
+    mat_buf, fused_buf = compiled.execute(x_dev, packed_dev, scales_dev)
+
+    assert isinstance(mat_buf, Buffer)
+    assert isinstance(fused_buf, Buffer)
+    mat = np.from_dlpack(mat_buf.to(CPU())).astype(np.float32)
+    fused = np.from_dlpack(fused_buf.to(CPU())).astype(np.float32)
+
+    assert fused.shape == (M, N)
+    assert np.isfinite(fused).all(), "Fused NVFP4 output has NaN/Inf"
+
+    # Both feed identical bf16 weight values into the same bf16 tensor-core MMA;
+    # only the f32 accumulation order differs (different tiling), so they agree
+    # to bf16-MMA tolerance. The materialize kernel is the correctness oracle.
+    atol = 1e-2 + 1.6e-2 * np.abs(mat)
+    max_err = float(np.max(np.abs(fused - mat)))
+    assert np.all(np.abs(fused - mat) <= atol), (
+        f"Fused NVFP4 matmul mismatch vs materialize oracle: max_err={max_err}"
+    )
+
+
+def _snap_to_e2m1_graph(v: TensorValue) -> TensorValue:
+    """Round a graph tensor onto the signed E2M1 grid {0,.5,1,1.5,2,3,4,6}."""
+    a = ops.abs(v)
+    z = a * 0.0
+    sign = ops.where(v < 0.0, z - 1.0, z + 1.0)
+    mag = ops.where(
+        a > 5.0, z + 6.0,
+        ops.where(a >= 3.5, z + 4.0,
+        ops.where(a >= 2.5, z + 3.0,
+        ops.where(a >= 1.75, z + 2.0,
+        ops.where(a >= 1.25, z + 1.5,
+        ops.where(a >= 0.75, z + 1.0,
+        ops.where(a >= 0.25, z + 0.5, z)))))),
+    )
+    return sign * mag
+
+
+def _fake_quant_fp4_act_graph(x: TensorValue) -> TensorValue:
+    """In-graph NVFP4 activation fake-quant (bf16 -> fp4 -> bf16), input_scale=1.
+
+    Matches the W4A4 kernel's dynamic per-block-16 activation quantization exactly
+    (amax/6 -> fp8 block scale, e2m1 snap), so a materialize-op matmul on this
+    tensor is the block-scaled result the native FP4 kernel must reproduce.
+    """
+    m = int(x.shape[0])
+    k = int(x.shape[1])
+    n_blk = k // _SF_VECTOR_SIZE
+    xf = ops.cast(x, DType.float32)
+    xb = ops.reshape(xf, [m, n_blk, _SF_VECTOR_SIZE])
+    amax = ops.max(ops.abs(xb), axis=-1)
+    scale_q = ops.cast(
+        ops.cast(amax / 6.0, DType.float8_e4m3fn), DType.float32
+    )
+    scale_safe = ops.where(scale_q > 0.0, scale_q, scale_q * 0.0 + 1.0)
+    q = _snap_to_e2m1_graph(xb / scale_safe)
+    x_hat = ops.reshape(q * scale_q, [m, k])
+    return ops.cast(x_hat, DType.bfloat16)
+
+
+def test_linear_nvfp4_cuda_w4a4_matches_sim() -> None:
+    """Native FP4 W4A4 op == fake-quant(activation) + materialize W4A16 oracle.
+
+    The native FP4xFP4 kernel (``mo.matmul.block.scaled.cuda.w4a4``) quantizes the
+    activation to fp4 internally and runs the sm_120a block-scaled FP4 tensor-core
+    MMA. The reference fake-quantizes the activation with the *identical* recipe
+    in-graph, then runs the proven materialize->dense W4A16 oracle on it -- so both
+    compute the same block-scaled matmul over the same quantized operands and must
+    agree to bf16-MMA tolerance. This is the image-validated W4A4 simulation, so a
+    pass means the native kernel reproduces the validated numerics.
+    """
+    _skip_if_not_cuda_w4a16()
+
+    rng = np.random.default_rng(2)
+    m, n, k = 8, 256, 512
+
+    device = Accelerator(0)
+    device_ref = DeviceRef(device.label, device.id)
+
+    nibbles = rng.integers(0, 16, size=(n, k), dtype=np.uint8)
+    packed = _pack_fp4_weight(nibbles)
+    scale_k = k // _SF_VECTOR_SIZE
+    scales_fp32 = rng.integers(1, 5, size=(n, scale_k)).astype(
+        np.float32
+    ) * np.float32(0.5)
+    scales_fp8_bytes = _fp32_to_fp8_bytes(scales_fp32, device, device_ref)
+
+    # Wider activation range so the fp4 activation quant is exercised.
+    x_fp32 = (rng.standard_normal((m, k)) * 0.5).astype(np.float32)
+
+    session = InferenceSession(devices=[device])
+    with Graph(
+        "NVFP4_CUDA_W4A4_vs_sim",
+        input_types=[
+            TensorType(DType.float32, (m, k), device=device_ref),
+            TensorType(DType.uint8, (n, k // 2), device=device_ref),
+            TensorType(DType.float8_e4m3fn, (n, scale_k), device=device_ref),
+        ],
+    ) as graph:
+        x_in, packed_in, scales_in = graph.inputs
+        assert isinstance(x_in, TensorValue)
+        assert isinstance(packed_in, TensorValue)
+        assert isinstance(scales_in, TensorValue)
+        x_bf16 = ops.cast(x_in, DType.bfloat16)
+
+        # Reference: fake-quant the activation to fp4 (identical recipe), then the
+        # proven materialize oracle (bf16 MMA over the dequantized operands).
+        x_fake = _fake_quant_fp4_act_graph(x_bf16)
+        out_sim = _cuda_weight_only_block_scaled_matmul(
+            x_fake, packed_in, scales_in, out_type=DType.bfloat16
+        )
+        # Under test: the native FP4xFP4 W4A4 op. weight_scale_2=1.0 keeps the
+        # (now in-kernel) epilogue fold numerically inert for the sim compare.
+        ws2_one = ops.constant(
+            1.0, dtype=DType.float32, device=DeviceRef.CPU()
+        )
+        out_w4a4 = _cuda_w4a4_matmul(
+            x_bf16, packed_in, scales_in, ws2_one, out_type=DType.bfloat16
+        )
+
+        graph.output(
+            ops.cast(out_sim, DType.float32),
+            ops.cast(out_w4a4, DType.float32),
+        )
+
+    compiled = session.load(graph)
+    x_dev = Buffer.from_numpy(x_fp32).to(device)
+    packed_dev = Buffer.from_numpy(packed).to(device)
+    scales_dev = (
+        Buffer.from_numpy(scales_fp8_bytes)
+        .view(DType.float8_e4m3fn, (n, scale_k))
+        .to(device)
+    )
+    sim_buf, w4a4_buf = compiled.execute(x_dev, packed_dev, scales_dev)
+
+    assert isinstance(sim_buf, Buffer)
+    assert isinstance(w4a4_buf, Buffer)
+    sim = np.from_dlpack(sim_buf.to(CPU())).astype(np.float32)
+    w4a4 = np.from_dlpack(w4a4_buf.to(CPU())).astype(np.float32)
+
+    assert w4a4.shape == (m, n)
+    assert np.isfinite(w4a4).all(), "W4A4 NVFP4 output has NaN/Inf"
+
+    atol = 2e-2 + 2e-2 * np.abs(sim)
+    max_err = float(np.max(np.abs(w4a4 - sim)))
+    assert np.all(np.abs(w4a4 - sim) <= atol), (
+        f"Native W4A4 matmul mismatch vs fake-quant sim: max_err={max_err}"
     )
