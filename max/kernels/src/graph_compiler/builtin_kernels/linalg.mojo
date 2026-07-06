@@ -47,6 +47,16 @@ from linalg.matmul.gpu.amd import (
 from linalg.mxfp4_matmul_sm90 import mxfp4_matmul_sm90
 from linalg.matmul.gpu.apple.fp4_matmul import enqueue_apple_fp4_matmul
 from linalg.matmul.gpu.nvfp4_w4a16_cuda import nvfp4_w4a16_matmul_cuda
+from linalg.matmul.gpu.nvfp4_w4a16_fused_cuda import (
+    nvfp4_w4a16_fused_matmul_cuda,
+)
+from linalg.matmul.gpu.nvfp4_w4a4_cuda import (
+    nvfp4_quant_act_cuda,
+    nvfp4_w4a4_matmul_cuda_tiled,
+    nvfp4_w4a4_matmul_cuda_tiled_fusedq,
+    nvfp4_w4a4_matmul_cuda_tiled_prequant,
+)
+from std.os.env import getenv
 from linalg.grouped_matmul_sm100_blockwise_fp8 import (
     grouped_matmul_dynamic_scaled_fp8,
 )
@@ -1101,6 +1111,189 @@ struct Struct_matmul_weight_only_block_scaled_cuda:
             a.to_tile_tensor[DType.int64](),
             b.to_tile_tensor[DType.int64](),
             b_scales.to_tile_tensor[DType.int64](),
+            context,
+        )
+
+
+@compiler.register("mo.matmul.weight.only.block.scaled.cuda.fused")
+struct Struct_matmul_weight_only_block_scaled_cuda_fused:
+    """NVIDIA weight-only NVFP4 (W4A16) FUSED matmul: `out = a @ dequant(b)^T`.
+
+    The FUSED sibling of `mo.matmul.weight.only.block.scaled.cuda`: same operand
+    contract and same numeric result, but instead of dequantizing the whole
+    packed FP4 weight to a transient dense bf16 buffer and running a dense GEMM,
+    it decodes packed FP4 weight sub-tiles to bf16 in shared memory INSIDE the
+    GEMM mainloop (`nvfp4_w4a16_fused_matmul_cuda`), so the weight is read from
+    DRAM as 4-bit and never materialized. Like the materialize op -- and unlike
+    the SM100 `mo.matmul.dynamic.block.scaled` path -- the activation `a` stays
+    bf16 and the weight block scales are PLAIN rank-2 `[N, K // 16]`. The NVFP4
+    per-tensor `weight_scale_2` scalar is applied at the graph level by the
+    caller (a post-matmul multiply), so it is not an input here.
+    """
+
+    @always_inline
+    @staticmethod
+    def execute[
+        c_type: DType,
+        //,
+        target: StaticString,
+    ](
+        c: OutputTensor[dtype=c_type, rank=2, ...],
+        a: InputTensor[dtype=DType.bfloat16, rank=2, ...],
+        b: InputTensor[dtype=DType.uint8, rank=2, ...],
+        b_scales: InputTensor[dtype=DType.float8_e4m3fn, rank=2, ...],
+        context: DeviceContext,
+    ) raises:
+        comptime assert is_gpu[
+            target
+        ](), "NVIDIA weight-only block-scaled matmul only supports GPUs"
+        comptime assert has_nvidia_gpu_accelerator(), (
+            "mo.matmul.weight.only.block.scaled.cuda.fused requires an NVIDIA"
+            " GPU accelerator"
+        )
+
+        nvfp4_w4a16_fused_matmul_cuda(
+            c.to_tile_tensor[DType.int64](),
+            a.to_tile_tensor[DType.int64](),
+            b.to_tile_tensor[DType.int64](),
+            b_scales.to_tile_tensor[DType.int64](),
+            context,
+        )
+
+
+@compiler.register("mo.matmul.block.scaled.cuda.w4a4")
+struct Struct_matmul_block_scaled_cuda_w4a4:
+    """NVIDIA NATIVE NVFP4 W4A4 matmul: fp4 activation x fp4 weight, HW block scales.
+
+    Unlike the W4A16 ops (which keep `a` bf16 and decode the fp4 weight to bf16),
+    this quantizes the activation to fp4 too and runs the native sm_120a
+    block-scaled FP4 tensor-core MMA via the SMEM-tiled GEMM
+    (`nvfp4_w4a4_matmul_cuda_tiled`; bit-identical to the naive launcher, ~7-9x
+    faster at large M). Same operand contract as the W4A16 ops (bf16 `a` in,
+    packed fp4 weight, fp8-e4m3 weight block scales); the activation is
+    dynamically quantized inside the launcher and the per-tensor
+    `weight_scale_2` (`s2`, 1 f32) is folded in the GEMM epilogue with the
+    same double rounding as the old graph-side post-matmul fold -- output is
+    byte-identical while eliminating one cast*mul*cast elementwise kernel
+    per matmul.
+    """
+
+    @always_inline
+    @staticmethod
+    def execute[
+        c_type: DType,
+        //,
+        target: StaticString,
+    ](
+        c: OutputTensor[dtype=c_type, rank=2, ...],
+        a: InputTensor[dtype=DType.bfloat16, rank=2, ...],
+        b: InputTensor[dtype=DType.uint8, rank=2, ...],
+        b_scales: InputTensor[dtype=DType.float8_e4m3fn, rank=2, ...],
+        s2: InputTensor[dtype=DType.float32, rank=1, ...],
+        context: DeviceContext,
+    ) raises:
+        comptime assert is_gpu[
+            target
+        ](), "NVIDIA native FP4 W4A4 matmul only supports GPUs"
+        comptime assert has_nvidia_gpu_accelerator(), (
+            "mo.matmul.block.scaled.cuda.w4a4 requires an NVIDIA GPU accelerator"
+        )
+
+        # MODULAR_NVFP4_FUSEDQ=1 selects the fused-prologue-quant kernel
+        # (bit-identical result, one launch, no packed-A DRAM round-trip).
+        if getenv("MODULAR_NVFP4_FUSEDQ") == "1":
+            nvfp4_w4a4_matmul_cuda_tiled_fusedq(
+                c.to_tile_tensor[DType.int64](),
+                a.to_tile_tensor[DType.int64](),
+                b.to_tile_tensor[DType.int64](),
+                b_scales.to_tile_tensor[DType.int64](),
+                s2.to_tile_tensor[DType.int64](),
+                context,
+            )
+        else:
+            nvfp4_w4a4_matmul_cuda_tiled(
+                c.to_tile_tensor[DType.int64](),
+                a.to_tile_tensor[DType.int64](),
+                b.to_tile_tensor[DType.int64](),
+                b_scales.to_tile_tensor[DType.int64](),
+                s2.to_tile_tensor[DType.int64](),
+                context,
+            )
+
+
+@compiler.register("mo.quant.act.fp4.cuda")
+struct Struct_quant_act_fp4_cuda:
+    """Dynamic per-block-16 NVFP4 activation quant as a standalone graph op.
+
+    Splitting the quant out of `mo.matmul.block.scaled.cuda.w4a4` lets the
+    graph quantize a shared activation ONCE for several consuming Linears
+    (q/k/v projections, per-block modulation) and moves the packed/scale
+    scratch to graph-managed tensors (no per-matmul `enqueue_create_buffer`).
+    """
+
+    @always_inline
+    @staticmethod
+    def execute[
+        target: StaticString,
+    ](
+        out_packed: OutputTensor[dtype = DType.uint8, rank=2, ...],
+        out_scale: OutputTensor[dtype = DType.float8_e4m3fn, rank=2, ...],
+        a: InputTensor[dtype = DType.bfloat16, rank=2, ...],
+        context: DeviceContext,
+    ) raises:
+        comptime assert is_gpu[
+            target
+        ](), "NVFP4 activation quant only supports GPUs"
+        comptime assert has_nvidia_gpu_accelerator(), (
+            "mo.quant.act.fp4.cuda requires an NVIDIA GPU accelerator"
+        )
+        nvfp4_quant_act_cuda(
+            out_packed.to_tile_tensor[DType.int64](),
+            out_scale.to_tile_tensor[DType.int64](),
+            a.to_tile_tensor[DType.int64](),
+            context,
+        )
+
+
+@compiler.register("mo.matmul.block.scaled.cuda.w4a4.prequant")
+struct Struct_matmul_block_scaled_cuda_w4a4_prequant:
+    """W4A4 tiled GEMM over a PRE-quantized activation (see quant op above).
+
+    Identical GEMM kernel/dispatch/epilogue as `mo.matmul.block.scaled.cuda.w4a4`
+    (including the fused double-rounded `weight_scale_2`); the activation
+    arrives packed from `mo.quant.act.fp4.cuda`, so results are byte-identical
+    to the all-in-one op while shared activations quantize once.
+    """
+
+    @always_inline
+    @staticmethod
+    def execute[
+        c_type: DType,
+        //,
+        target: StaticString,
+    ](
+        c: OutputTensor[dtype=c_type, rank=2, ...],
+        a_packed: InputTensor[dtype = DType.uint8, rank=2, ...],
+        a_scales: InputTensor[dtype = DType.float8_e4m3fn, rank=2, ...],
+        b: InputTensor[dtype = DType.uint8, rank=2, ...],
+        b_scales: InputTensor[dtype = DType.float8_e4m3fn, rank=2, ...],
+        s2: InputTensor[dtype = DType.float32, rank=1, ...],
+        context: DeviceContext,
+    ) raises:
+        comptime assert is_gpu[
+            target
+        ](), "NVIDIA native FP4 W4A4 matmul only supports GPUs"
+        comptime assert has_nvidia_gpu_accelerator(), (
+            "mo.matmul.block.scaled.cuda.w4a4.prequant requires an NVIDIA GPU"
+            " accelerator"
+        )
+        nvfp4_w4a4_matmul_cuda_tiled_prequant(
+            c.to_tile_tensor[DType.int64](),
+            a_packed.to_tile_tensor[DType.int64](),
+            a_scales.to_tile_tensor[DType.int64](),
+            b.to_tile_tensor[DType.int64](),
+            b_scales.to_tile_tensor[DType.int64](),
+            s2.to_tile_tensor[DType.int64](),
             context,
         )
 

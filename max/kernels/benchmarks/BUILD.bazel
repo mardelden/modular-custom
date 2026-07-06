@@ -48,6 +48,8 @@ _EXTRA_CONSTRAINTS = {
     "gpu/linalg/bench_apple_gpu_matmul.mojo": ["//:apple_gpu"],  # Apple M5 simdgroup matmul (incl. split-K) — Metal only
     "gpu/linalg/bench_apple_fp4_matmul.mojo": ["//:apple_gpu"],  # Apple M5 weight-only NVFP4 (W4A16) matmul — Metal only
     "gpu/linalg/bench_apple_fp4_reconcile.mojo": ["//:apple_gpu"],  # Apple M5 W4A16 dispatch-path benchmark — Metal only
+    "gpu/linalg/bench_nvfp4_fused.mojo": ["//:nvidia_gpu"],  # CUDA NVFP4 W4A16 fused vs materialize vs bf16 — sm_120 (no SM100 UMMA)
+    "gpu/linalg/bench_nvfp4_w4a4.mojo": ["//:nvidia_gpu"],  # CUDA NVFP4 W4A4 native FP4xFP4 vs bf16 — sm_120 (D2/M2)
     "gpu/nn/bench_conv2d_apple.mojo": ["//:apple_gpu"],  # Apple M5 im2col conv2d vs naive — Metal only
     "gpu/nn/bench_apple_fa_prefill.mojo": ["//:apple_gpu"],  # Apple M5 MMA flash-attention prefill (no-SMEM + SMEM-staged) — Metal only
     "gpu/linalg/bench_matmul.mojo": select({

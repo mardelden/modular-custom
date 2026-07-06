@@ -29,6 +29,8 @@ _EXTRA_CONSTRAINTS = {
     "test_async_copy_wgmma.mojo": ["//:h100_gpu"],
     "test_gemm_kernel.mojo": ["//:nvidia_gpu"],  # FIXME: KERN-1377
     "test_gemm_kernel_new.mojo": ["//:nvidia_gpu"],  # Requires 32-thread warps
+    # Fused NVFP4 (W4A16) matmul: NVIDIA m16n8k16 tensor-core path (sm_120).
+    "test_nvfp4_w4a16_fused_cuda.mojo": ["//:nvidia_gpu"],
     "test_gemv.mojo": select({
         "//:apple_gpu": ["@platforms//:incompatible"],
         "//conditions:default": [],
