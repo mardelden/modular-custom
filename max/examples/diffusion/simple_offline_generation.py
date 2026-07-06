@@ -241,6 +241,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Profile timings of the pipeline.",
     )
     parser.add_argument(
+        "--kineto-trace",
+        action="store_true",
+        help=(
+            "Capture a libkineto (CUPTI) Chrome trace of exactly ONE "
+            "steady-state pipeline.execute() (run warmups first with "
+            "--num-warmups). The trace JSON path is printed on completion."
+        ),
+    )
+    parser.add_argument(
         "--num-warmups",
         type=int,
         default=0,
@@ -743,7 +752,31 @@ async def generate_image(args: argparse.Namespace) -> None:
 
     # Step 7: Execute the pipeline
     print("Running diffusion model...")
-    if args.profile_timings:
+    if args.kineto_trace:
+        # torch.profiler's CUPTI activity tracing is process-wide, so it
+        # records every CUDA kernel in this process -- including MAX's --
+        # not just torch ops. (MAX's own libkineto hook is a no-op in builds
+        # without libkineto linked; state print below diagnoses that.)
+        try:
+            from max._core.profiler import kineto_state
+
+            print(f"KINETO_STATE: {kineto_state()}")
+        except Exception as ex:  # noqa: BLE001
+            print(f"KINETO_STATE unavailable: {ex}")
+
+        from torch.profiler import ProfilerActivity, profile
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        ) as prof:
+            start_time = time.perf_counter()
+            outputs = pipeline.execute(inputs)
+            elapsed = time.perf_counter() - start_time
+        print(f"TORCH_PROF: profiled execute took {elapsed:.3f}s")
+        trace_out = "/root/torch_trace.json"
+        prof.export_chrome_trace(trace_out)
+        print(f"TORCH_TRACE: {trace_out}")
+    elif args.profile_timings:
         with profile_execute(pipeline) as prof:
             for i in range(args.num_profile_iterations):
                 print(

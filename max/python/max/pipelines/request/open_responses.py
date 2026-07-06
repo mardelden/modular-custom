@@ -28,6 +28,7 @@ import base64
 import json
 import logging
 import mimetypes
+import os
 import time
 from enum import Enum
 from io import BytesIO
@@ -483,7 +484,16 @@ class OutputImageContent(BaseModel):
 
         # Convert to bytes
         buffer = BytesIO()
-        pil_image.save(buffer, format=format.upper())
+        save_kwargs: dict[str, Any] = {}
+        if format.lower() == "png":
+            # PIL's default PNG compression (zlib level 6) costs ~250+ ms for
+            # a detailed 1024x1024 render and sits directly on the serving
+            # latency path; level 1 is ~4-5x faster for a ~30-50% larger file
+            # and is equally lossless. Override via MODULAR_PNG_COMPRESS_LEVEL.
+            save_kwargs["compress_level"] = int(
+                os.environ.get("MODULAR_PNG_COMPRESS_LEVEL", "1")
+            )
+        pil_image.save(buffer, format=format.upper(), **save_kwargs)
         image_bytes = buffer.getvalue()
 
         # Encode as base64

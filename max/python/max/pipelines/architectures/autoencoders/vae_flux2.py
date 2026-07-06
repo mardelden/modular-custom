@@ -19,6 +19,7 @@ without max.experimental dependencies.
 """
 
 import math
+import os
 
 from max.driver import accelerator_api, accelerator_architecture_name
 from max.dtype import DType
@@ -368,9 +369,45 @@ class VAEAttention(Module):
         k = ops.reshape(k, [n, seq_len, self.heads, self.dim_head])
         v = ops.reshape(v, [n, seq_len, self.heads, self.dim_head])
 
-        out = flash_attention_gpu(
-            q, k, v, mask_variant=MHAMaskVariant.NULL_MASK, scale=self.scale
+        # On consumer NVIDIA (sm_120) the fused `mo.mha.no_cache` op only has a
+        # flash kernel for head_dim 64/128; other depths (this mid-block is
+        # heads=1, dim_head=512) SILENTLY fall back to `mha_gpu_naive` -- two
+        # scalar O(S^2 * D) BMM kernels (~37 ms EACH at 1024^2, S = 16384) plus
+        # a materialized-softmax pass. The unfused graph path below runs the
+        # same math as tensor-core matmuls + fused softmax (~10x faster).
+        # MODULAR_VAE_UNFUSED_ATTN=0 restores the fused op (e.g. on sm_90 /
+        # sm_100 datacenter parts, where a native hdim-512 flash kernel exists).
+        use_unfused = (
+            os.environ.get("MODULAR_VAE_UNFUSED_ATTN", "1") == "1"
+            and self.dim_head not in (64, 128)
         )
+        if use_unfused:
+            # [n, seq, heads, d] -> [n, heads, seq, d]. In THIS (Graph API)
+            # stack the rank-4 batched matmuls lower to tensor-core kernels
+            # (measured: replaces the ~74 ms naive-mha with ~4 ms of GEMMs).
+            # Do NOT port this verbatim to the modulev3 twin
+            # (autoencoders_modulev3): there the rank-4 matmul falls back to
+            # `matmul_kernel_naive` (~140 ms per matmul at S = 16384).
+            qh = ops.permute(q, [0, 2, 1, 3])
+            kh = ops.permute(k, [0, 2, 1, 3])
+            vh = ops.permute(v, [0, 2, 1, 3])
+            # Match the fused kernel's numerics: f32 scores, scaled, softmax
+            # over keys, probabilities back to the value dtype for the PV mma.
+            scores = (
+                ops.cast(qh @ ops.permute(kh, [0, 1, 3, 2]), DType.float32)
+                * self.scale
+            )
+            probs = ops.softmax(scores)
+            out = ops.cast(probs, v.dtype) @ vh  # [n, heads, seq, d]
+            out = ops.permute(out, [0, 2, 1, 3])  # -> [n, seq, heads, d]
+        else:
+            out = flash_attention_gpu(
+                q,
+                k,
+                v,
+                mask_variant=MHAMaskVariant.NULL_MASK,
+                scale=self.scale,
+            )
 
         out = ops.reshape(out, [n, seq_len, self.inner_dim])
         out = self.to_out[0](out)
