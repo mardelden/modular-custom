@@ -313,9 +313,17 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
             shape=["batch_size"],
             device=self.max_device,
         )
+        # Under dynamic batching, img_ids carry a per-row batch dim so each
+        # request keeps its own image-position offset (independent of batch
+        # neighbors); otherwise they are shared [image_seq_len, axes].
+        img_ids_shape: list[Any] = (
+            ["batch_size", "image_seq_len", len(self.axes_dims)]
+            if self.dynamic_batching
+            else ["image_seq_len", len(self.axes_dims)]
+        )
         img_ids_type = TensorType(
             DType.int64,
-            shape=["image_seq_len", len(self.axes_dims)],
+            shape=img_ids_shape,
             device=self.max_device,
         )
         txt_ids_type = TensorType(
@@ -380,15 +388,36 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
 
         if txt_ids.rank == 3:
             txt_ids = txt_ids[0]
-        if img_ids.rank == 3:
+        # Under dynamic batching img_ids are per-row [batch, img_len, axes];
+        # keep the batch dim so each request ropes with its own offset.
+        if not self.dynamic_batching and img_ids.rank == 3:
             img_ids = img_ids[0]
 
         txt_freqs = self.rope_embedder(txt_ids)
         img_freqs = self.rope_embedder(img_ids)
-        unified_freqs = (
-            F.concat([img_freqs[0], txt_freqs[0]], axis=0),
-            F.concat([img_freqs[1], txt_freqs[1]], axis=0),
-        )
+
+        if self.dynamic_batching:
+            # img_freqs: per-row [batch, img_len, D]; txt_freqs: shared [txt, D]
+            # (text positions are batch-independent). Broadcast txt across the
+            # batch and concat along the sequence axis.
+            batch = img_freqs[0].shape[0]
+            txt_len = txt_freqs[0].shape[0]
+            dim = txt_freqs[0].shape[1]
+            txt_cos = F.broadcast_to(
+                F.unsqueeze(txt_freqs[0], 0), [batch, txt_len, dim]
+            )
+            txt_sin = F.broadcast_to(
+                F.unsqueeze(txt_freqs[1], 0), [batch, txt_len, dim]
+            )
+            unified_freqs = (
+                F.concat([img_freqs[0], txt_cos], axis=1),
+                F.concat([img_freqs[1], txt_sin], axis=1),
+            )
+        else:
+            unified_freqs = (
+                F.concat([img_freqs[0], txt_freqs[0]], axis=0),
+                F.concat([img_freqs[1], txt_freqs[1]], axis=0),
+            )
 
         # Image tokens are never padded (fixed per resolution) -> no mask.
         for layer in self.noise_refiner:

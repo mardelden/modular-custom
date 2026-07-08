@@ -47,16 +47,29 @@ def apply_rotary_emb(
     if not use_real:
         raise NotImplementedError("Only use_real=True is supported")
 
-    cos, sin = freqs_cis  # [S, D]
-    # Expand cos/sin to match x shape based on sequence_dim
+    cos, sin = freqs_cis  # [S, D] (shared) or [B, S, D] (per-row batched)
+    # Expand cos/sin to match x shape based on sequence_dim. Per-row freqs
+    # (rank 3, [B, S, D]) already carry the batch dim, so we only add the
+    # head dim; shared freqs (rank 2, [S, D]) additionally broadcast over batch.
+    per_row = cos.rank == 3
     if sequence_dim == 2:
-        # x: [B, H, S, D], need cos/sin: [1, 1, S, D]
-        cos = F.unsqueeze(F.unsqueeze(cos, 0), 0)
-        sin = F.unsqueeze(F.unsqueeze(sin, 0), 0)
+        if per_row:
+            # x: [B, H, S, D], per-row cos: [B, 1, S, D]
+            cos = F.unsqueeze(cos, 1)
+            sin = F.unsqueeze(sin, 1)
+        else:
+            # x: [B, H, S, D], need cos/sin: [1, 1, S, D]
+            cos = F.unsqueeze(F.unsqueeze(cos, 0), 0)
+            sin = F.unsqueeze(F.unsqueeze(sin, 0), 0)
     elif sequence_dim == 1:
-        # x: [B, S, H, D], need cos/sin: [1, S, 1, D]
-        cos = F.unsqueeze(F.unsqueeze(cos, 0), 2)
-        sin = F.unsqueeze(F.unsqueeze(sin, 0), 2)
+        if per_row:
+            # x: [B, S, H, D], per-row cos: [B, S, 1, D]
+            cos = F.unsqueeze(cos, 2)
+            sin = F.unsqueeze(sin, 2)
+        else:
+            # x: [B, S, H, D], need cos/sin: [1, S, 1, D]
+            cos = F.unsqueeze(F.unsqueeze(cos, 0), 2)
+            sin = F.unsqueeze(F.unsqueeze(sin, 0), 2)
     else:
         raise ValueError(f"`sequence_dim={sequence_dim}` but should be 1 or 2.")
 
@@ -238,8 +251,10 @@ class RopeEmbedder(Module[[Tensor], tuple[Tensor, Tensor]]):
         self.axes_dims = axes_dims
 
     def forward(self, ids: Tensor) -> tuple[Tensor, Tensor]:
-        if ids.rank != 2:
-            raise ValueError(f"Expected 2D ids tensor, got rank={ids.rank}")
+        if ids.rank not in (2, 3):
+            raise ValueError(
+                f"Expected 2D [S,axes] or 3D [B,S,axes] ids, got rank={ids.rank}"
+            )
 
         if int(ids.shape[-1]) != len(self.axes_dims):
             raise ValueError(
@@ -250,15 +265,36 @@ class RopeEmbedder(Module[[Tensor], tuple[Tensor, Tensor]]):
         pos = ids.cast(DType.float32)
         cos_out = []
         sin_out = []
+        if ids.rank == 2:
+            # Shared positions [S, axes] -> per-axis [S, dim_i].
+            for i in range(len(self.axes_dims)):
+                cos_i, sin_i = get_1d_rotary_pos_embed(
+                    self.axes_dims[i],
+                    pos[:, i],
+                    theta=self.theta,
+                    use_real=True,
+                    repeat_interleave_real=True,
+                )
+                cos_out.append(cos_i)
+                sin_out.append(sin_i)
+            return F.concat(cos_out, axis=-1), F.concat(sin_out, axis=-1)
+
+        # Per-row positions [B, S, axes]: flatten to [B*S] for the 1D rotary
+        # helper (which uses F.outer and needs a 1D pos), then reshape back to
+        # [B, S, dim_i]. This lets each batch row carry its own image-position
+        # offset so a request's RoPE is independent of its batch neighbors.
+        batch = ids.shape[0]
+        seq = ids.shape[1]
         for i in range(len(self.axes_dims)):
+            pos_i = F.reshape(pos[:, :, i], [-1])  # [B*S]
             cos_i, sin_i = get_1d_rotary_pos_embed(
                 self.axes_dims[i],
-                pos[:, i],
+                pos_i,
                 theta=self.theta,
                 use_real=True,
                 repeat_interleave_real=True,
             )
-            cos_out.append(cos_i)
-            sin_out.append(sin_i)
+            cos_out.append(F.reshape(cos_i, [batch, seq, self.axes_dims[i]]))
+            sin_out.append(F.reshape(sin_i, [batch, seq, self.axes_dims[i]]))
 
         return F.concat(cos_out, axis=-1), F.concat(sin_out, axis=-1)

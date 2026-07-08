@@ -338,6 +338,16 @@ class ZImagePipeline(DiffusionPipeline):
             width=int(context.width),
             device=device,
         )
+        # Under a dynamic-batching build the graph expects per-row img_ids
+        # [batch, img_len, axes]. A single request has one text length, so all
+        # ``num_images`` rows share it (identical to the non-batched offset).
+        if bool(getattr(self.transformer.config, "dynamic_batching", False)):
+            img_ids_tensor = self._perrow_img_ids_tensor(
+                latent_image_ids=np.asarray(context.latent_image_ids),
+                real_txt_lens=[int(tokens_np.shape[0])],
+                num_images=int(context.num_images_per_prompt),
+                device=device,
+            )
 
         negative_tokens_tensor: Tensor | None = None
         negative_txt_ids_tensor: Tensor | None = None
@@ -491,14 +501,22 @@ class ZImagePipeline(DiffusionPipeline):
             storage=Buffer.from_dlpack(latents_np).to(device)
         )
 
-        # Shared conditioning ids sized to the padded text length.
+        # Shared text ids (positions 1..txt_padded); per-row image ids so each
+        # request keeps its own text-length offset (reproducible across batch
+        # neighbors).
         image_seq_len = int(np.asarray(ref.latent_image_ids).shape[-2])
-        txt_ids_tensor, img_ids_tensor = self._prepare_conditioning_ids(
+        txt_ids_tensor, _shared_img_ids = self._prepare_conditioning_ids(
             text_seq_len=txt_padded,
             image_seq_len=image_seq_len,
             latent_image_ids=np.asarray(ref.latent_image_ids),
             height=int(ref.height),
             width=int(ref.width),
+            device=device,
+        )
+        img_ids_tensor = self._perrow_img_ids_tensor(
+            latent_image_ids=np.asarray(ref.latent_image_ids),
+            real_txt_lens=real_lens,
+            num_images=int(ref.num_images_per_prompt),
             device=device,
         )
 
@@ -891,6 +909,35 @@ class ZImagePipeline(DiffusionPipeline):
             self._cached_text_ids[text_ids_key] = txt_ids_tensor
 
         return txt_ids_tensor, img_ids_tensor
+
+    def _perrow_img_ids_tensor(
+        self,
+        latent_image_ids: np.ndarray,
+        real_txt_lens: list[int],
+        num_images: int,
+        device: Device,
+    ) -> Tensor:
+        """Per-row image position ids ``[sum(num_images), img_len, axes]``.
+
+        Each request's image tokens are offset past its OWN (32-rounded) text
+        length -- exactly the offset it would get running alone -- so a request
+        batched with different-length neighbors keeps identical image RoPE and
+        thus a reproducible result. Mirrors the offset in
+        :meth:`_prepare_conditioning_ids` (``text_seq_len_padded + 1``).
+        """
+        base = np.asarray(latent_image_ids, dtype=np.int64)
+        if base.ndim == 3:
+            base = base[0]
+        base = np.ascontiguousarray(base)
+        rows: list[np.ndarray] = []
+        for real_txt in real_txt_lens:
+            padded = real_txt + (-real_txt % 32)
+            ids = base.copy()
+            ids[:, 0] = ids[:, 0] + padded + 1
+            for _ in range(num_images):
+                rows.append(ids)
+        stacked = np.ascontiguousarray(np.stack(rows, axis=0))
+        return Tensor(storage=Buffer.from_dlpack(stacked).to(device))
 
     def _align_prompt_seq_len(
         self,
