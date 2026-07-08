@@ -40,6 +40,12 @@ from ..autoencoders import AutoencoderKLModel
 from ..qwen3_modulev3.text_encoder import Qwen3TextEncoderZImageModel
 from .model import ZImageTransformerModel
 
+# The VAE group_norm kernel raises CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES at
+# batch >= 8; decode in chunks no larger than this (works for num_images and
+# dynamic batching alike). 4 leaves margin under the observed limit of 7.
+_VAE_DECODE_MAX_BATCH = 4
+
+
 _DEVICE_TENSOR_FIELDS = frozenset(
     {
         "tokens_tensor",
@@ -958,7 +964,20 @@ class ZImagePipeline(DiffusionPipeline):
         )
 
         latents = self._postprocess_latents(latents)
-        decoded: Tensor = self.vae.decode(latents)
+        # The VAE group_norm kernel throws CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES at
+        # batch >= 8, so decode in sub-batches and concat. The denoise loop
+        # already ran at the full batch, so this preserves the batching win;
+        # the VAE is only ~10% of the render, making the chunk overhead
+        # negligible.
+        vae_batch = int(latents.shape[0])
+        if vae_batch > _VAE_DECODE_MAX_BATCH:
+            parts: list[Tensor] = []
+            for start in range(0, vae_batch, _VAE_DECODE_MAX_BATCH):
+                chunk = latents[start : start + _VAE_DECODE_MAX_BATCH]
+                parts.append(self.vae.decode(chunk))
+            decoded: Tensor = F.concat(parts, axis=0)
+        else:
+            decoded = self.vae.decode(latents)
         image = self._to_numpy(decoded)
 
         # The responses image encoder requires uint8 [0, 255] in HWC per
