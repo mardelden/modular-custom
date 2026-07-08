@@ -267,6 +267,11 @@ class ZImagePipeline(DiffusionPipeline):
         self._cached_shape_carriers: dict[int, Tensor] = {}
         self._cached_timesteps_batched: dict[str, Tensor] = {}
         self._cached_timesteps_host: dict[str, np.ndarray] = {}
+        # Per-step timestep tensors tiled to ``batch_size`` (for
+        # ``num_images_per_prompt`` > 1); host arrays kept alive alongside the
+        # device tensors so the async host->device copy backing them is safe.
+        self._cached_timesteps_perstep: dict[str, list[Any]] = {}
+        self._cached_timesteps_perstep_host: dict[str, list[np.ndarray]] = {}
         self._cached_prompt_token_tensors: dict[str, Tensor] = {}
         self._cached_prompt_padding: dict[str, Tensor] = {}
 
@@ -980,6 +985,52 @@ class ZImagePipeline(DiffusionPipeline):
         self._cached_timesteps_host[cache_key] = transformed_timesteps
         return timesteps_tensor, transformed_timesteps
 
+    def _batched_timestep_tensors(
+        self,
+        transformed_timesteps: np.ndarray,
+        batch_size: int,
+        device: Device,
+    ) -> list[Any]:
+        """Per-step timestep tensors of shape ``[batch_size]``.
+
+        The transformer graph declares ``timestep`` with type
+        ``["batch_size"]`` (see :mod:`z_image`), so when generating multiple
+        images per prompt (``num_images_per_prompt`` > 1) the per-step scalar
+        timestep must be tiled to the batch dimension. Otherwise the graph
+        binds ``batch_size`` to 1 from the timestep while latents/embeds bind
+        it to N, raising a symbolic-dimension mismatch (the ``num_images`` > 1
+        HTTP 500). Cached per (schedule, ``batch_size``); the host arrays are
+        retained so the device tensors' backing memory stays valid.
+        """
+        num_timesteps = int(transformed_timesteps.shape[0])
+        first_t = float(transformed_timesteps[0]) if num_timesteps > 0 else 0.0
+        last_t = float(transformed_timesteps[-1]) if num_timesteps > 0 else 0.0
+        sum_t = float(transformed_timesteps.sum()) if num_timesteps > 0 else 0.0
+        cache_key = (
+            f"perstep::{num_timesteps}::{first_t:.8f}::{last_t:.8f}::"
+            f"{sum_t:.6f}::b{batch_size}"
+        )
+        cached = self._cached_timesteps_perstep.get(cache_key)
+        if cached is not None:
+            return cached
+
+        per_step: list[Any] = []
+        host_arrays: list[np.ndarray] = []
+        for t in transformed_timesteps:
+            arr = np.ascontiguousarray(
+                np.full((batch_size,), t, dtype=np.float32)
+            )
+            tensor = Tensor(storage=Buffer.from_dlpack(arr).to(device))
+            driver: Any = tensor
+            if hasattr(driver, "driver_tensor"):
+                driver = driver.driver_tensor
+            per_step.append(driver)
+            host_arrays.append(arr)
+
+        self._cached_timesteps_perstep[cache_key] = per_step
+        self._cached_timesteps_perstep_host[cache_key] = host_arrays
+        return per_step
+
     def _prepare_scheduler_inputs(
         self,
         model_inputs: ZImageModelInputs,
@@ -1091,6 +1142,18 @@ class ZImagePipeline(DiffusionPipeline):
                 )
             )
 
+        # For num_images_per_prompt > 1 the per-step timestep must be tiled to
+        # the batch dimension to match the transformer's ["batch_size"] input
+        # type (latents/embeds are already batched); batch_size == 1 keeps the
+        # original single-slice path unchanged.
+        batched_timesteps: list[Any] | None = None
+        if batch_size > 1:
+            batched_timesteps = self._batched_timestep_tensors(
+                transformed_timesteps=transformed_timesteps,
+                batch_size=batch_size,
+                device=device,
+            )
+
         cfg_active: np.ndarray | None = None
         if model_inputs.do_cfg:
             if model_inputs.cfg_truncation <= 1.0:
@@ -1104,7 +1167,10 @@ class ZImagePipeline(DiffusionPipeline):
         with Tracer("denoising_loop"):
             for i in range(num_timesteps):
                 with Tracer(f"denoising_step_{i}"):
-                    timestep = timesteps_seq[i : i + 1]
+                    if batched_timesteps is not None:
+                        timestep = batched_timesteps[i]
+                    else:
+                        timestep = timesteps_seq[i : i + 1]
                     apply_cfg = bool(
                         model_inputs.do_cfg
                         and cfg_active is not None
