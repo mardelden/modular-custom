@@ -116,7 +116,11 @@ class ZImageAttention(Module[..., Tensor]):
             # additive mask so each query excludes pad keys from its softmax --
             # this fully isolates a request from its batch neighbors (a pure
             # key-padding mask, unlike the ragged valid_length kernel).
-            mask = F.unsqueeze(attn_mask, 1)
+            mask = F.unsqueeze(attn_mask, 1)  # [batch, 1, kv_seq]
+            # The mask's kv dim comes in as a separate symbolic dim from the
+            # attention sequence (which is a concat-derived dim); rebind asserts
+            # they are equal so broadcast_to can unify them.
+            mask = F.rebind(mask, [batch_size, 1, seq_len])
             mask = F.broadcast_to(mask, [batch_size, seq_len, seq_len])
             mask = mask.cast(value.dtype)
             out = masked_flash_attention_gpu(query, key, value, mask, scale=scale)
