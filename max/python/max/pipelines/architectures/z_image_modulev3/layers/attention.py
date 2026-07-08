@@ -55,6 +55,7 @@ class ZImageAttention(Module[..., Tensor]):
         self,
         hidden_states: Tensor,
         freqs_cis: tuple[Tensor, Tensor],
+        valid_length: Tensor | None = None,
     ) -> Tensor:
         batch_size = hidden_states.shape[0]
         seq_len = hidden_states.shape[1]
@@ -93,12 +94,18 @@ class ZImageAttention(Module[..., Tensor]):
         query = query.cast(value.dtype)
         key = key.cast(value.dtype)
 
+        # ``valid_length`` (per-row [batch] uint32) selects the padded-attention
+        # kernel so pad key positions (right-padded text in a dynamically
+        # batched request) are excluded from every query's softmax. When None
+        # (single-request / non-batched path) this is the plain NULL_MASK
+        # kernel — byte-identical to the unbatched behavior.
         out = flash_attention_gpu(
             query,
             key,
             value,
             mask_variant=MHAMaskVariant.NULL_MASK,
             scale=math.sqrt(1.0 / float(self.head_dim)),
+            valid_length=valid_length,
         )
 
         out = F.reshape(out, [batch_size, seq_len, self.inner_dim])

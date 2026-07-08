@@ -157,6 +157,28 @@ class DiffusionPipeline(ABC):
             f"prepare_inputs is not implemented for {self.__class__.__name__}"
         )
 
+    @property
+    def supports_dynamic_batching(self) -> bool:
+        """Whether this pipeline can batch multiple compatible requests into a
+        single execution. Subclasses that implement
+        :meth:`prepare_inputs_batched` override this (typically gated on a
+        runtime flag). Default: no.
+        """
+        return False
+
+    def prepare_inputs_batched(
+        self, contexts: list[PixelContext]
+    ) -> Any:
+        """Prepare inputs for a batch of compatible requests.
+
+        Only called when :attr:`supports_dynamic_batching` is True. The base
+        raises so non-batching pipelines fail loudly if mis-dispatched.
+        """
+        raise NotImplementedError(
+            "prepare_inputs_batched is not implemented for "
+            f"{self.__class__.__name__}"
+        )
+
     @abstractmethod
     def execute(
         self, model_inputs: Any, **kwargs: Any

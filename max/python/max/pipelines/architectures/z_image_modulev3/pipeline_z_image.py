@@ -162,6 +162,18 @@ class ZImageModelInputs:
     h_carrier: Tensor
     w_carrier: Tensor
 
+    # -- dynamic-batching (masked) fields; set only by prepare_inputs_batched --
+    batched_token_tensors: list[Tensor] | None = None
+    """Per-context positive token tensors for the masked dynamic-batch path.
+
+    When set, ``execute`` encodes each separately, right-pads the embeddings to
+    the batch's max text length, broadcasts to ``num_images_per_prompt``, and
+    concatenates -- with per-row ``valid_length`` masking the pad text keys. The
+    concatenated per-context latents live in ``latents_tensor`` and
+    ``txt_ids_tensor`` / ``img_ids_tensor`` are already sized to the padded
+    text length.
+    """
+
     @classmethod
     def kwargs_from_context(cls, context: PixelContext) -> dict[str, Any]:
         """Build kwargs for all fields except device tensors."""
@@ -237,6 +249,16 @@ class ZImagePipeline(DiffusionPipeline):
         "text_encoder": Qwen3TextEncoderZImageModel,
         "transformer": ZImageTransformerModel,
     }
+
+    @property
+    def supports_dynamic_batching(self) -> bool:
+        """True iff the transformer graph was built with the masked
+        (padded-attention) dynamic-batching path, i.e.
+        ``MODULAR_PIXEL_MAX_BATCH_SIZE > 1`` at load time. The base
+        ``PixelGenerationPipeline`` reads this to decide whether the scheduler
+        may group concurrent compatible requests onto ``prepare_inputs_batched``.
+        """
+        return bool(getattr(self.transformer.config, "dynamic_batching", False))
 
     @traced(message="ZImagePipeline.init_remaining_components")
     def init_remaining_components(self) -> None:
@@ -390,6 +412,135 @@ class ZImagePipeline(DiffusionPipeline):
             w_carrier=w_carrier,
         )
 
+    @traced(message="ZImagePipeline.prepare_inputs_batched")
+    def prepare_inputs_batched(
+        self,
+        contexts: list[PixelContext],
+    ) -> ZImageModelInputs:
+        """Collate multiple compatible requests into one masked batch.
+
+        Different-length prompts are right-padded to the batch's max text
+        length; the per-row ``valid_length`` built in :meth:`execute` masks the
+        pad text keys so each request's output is independent of its batch
+        neighbors. Latents/num_images are concatenated in ``contexts`` order to
+        match the base pipeline's per-request output split.
+
+        Scoped to text-to-image, ``guidance_scale == 0`` (non-CFG) — the Turbo
+        default. A single context defers to :meth:`prepare_inputs`.
+        """
+        if not contexts:
+            raise ValueError(
+                "prepare_inputs_batched requires at least one context"
+            )
+        if len(contexts) == 1:
+            return self.prepare_inputs(contexts[0])
+
+        ref = contexts[0]
+        for c in contexts:
+            _validate_z_image_context(c)
+
+        for c in contexts[1:]:
+            if (
+                int(c.height) != int(ref.height)
+                or int(c.width) != int(ref.width)
+                or int(c.num_inference_steps) != int(ref.num_inference_steps)
+                or int(c.num_images_per_prompt)
+                != int(ref.num_images_per_prompt)
+                or c.input_image is not None
+                or ref.input_image is not None
+                or not np.array_equal(
+                    np.asarray(c.sigmas), np.asarray(ref.sigmas)
+                )
+            ):
+                raise ValueError(
+                    "Z-Image dynamic batching requires matching resolution, "
+                    "steps, num_images and sigma schedule (text-to-image only)."
+                )
+        for c in contexts:
+            if float(c.guidance_scale) > 0.0 and c.negative_tokens is not None:
+                raise NotImplementedError(
+                    "Z-Image dynamic batching supports guidance_scale=0 "
+                    "(non-CFG) requests only."
+                )
+
+        device = self.transformer.devices[0]
+        text_device = self.text_encoder.devices[0]
+
+        # Per-context positive token tensors + host-known real text lengths.
+        token_tensors: list[Tensor] = []
+        real_lens: list[int] = []
+        for c in contexts:
+            toks_np = self._select_tokens_for_text_encoder(c.tokens.array, c.mask)
+            real_lens.append(int(toks_np.shape[0]))
+            token_tensors.append(
+                self._token_tensor_from_numpy(toks_np, text_device)
+            )
+        txt_padded = max(real_lens)
+
+        # Concatenate per-context latents -> [sum(num_images), C, H, W].
+        latents_np = np.ascontiguousarray(
+            np.concatenate([np.asarray(c.latents) for c in contexts], axis=0)
+        )
+        latents_tensor = Tensor(
+            storage=Buffer.from_dlpack(latents_np).to(device)
+        )
+
+        # Shared conditioning ids sized to the padded text length.
+        image_seq_len = int(np.asarray(ref.latent_image_ids).shape[-2])
+        txt_ids_tensor, img_ids_tensor = self._prepare_conditioning_ids(
+            text_seq_len=txt_padded,
+            image_seq_len=image_seq_len,
+            latent_image_ids=np.asarray(ref.latent_image_ids),
+            height=int(ref.height),
+            width=int(ref.width),
+            device=device,
+        )
+
+        latents_4d = np.asarray(ref.latents)
+        latent_h = int(latents_4d.shape[-2])
+        latent_w = int(latents_4d.shape[-1])
+        packed_h = latent_h // 2
+        packed_w = latent_w // 2
+
+        num_steps = int(ref.num_inference_steps)
+        sigmas_key = f"sigmas::{num_steps}::{latent_h}x{latent_w}"
+        if sigmas_key in self._cached_sigmas:
+            sigmas_tensor = self._cached_sigmas[sigmas_key]
+        else:
+            sigmas_tensor = Tensor(
+                storage=Buffer.from_dlpack(
+                    np.ascontiguousarray(ref.sigmas)
+                ).to(device)
+            )
+            self._cached_sigmas[sigmas_key] = sigmas_tensor
+
+        for n in (packed_h, packed_w):
+            if n not in self._cached_shape_carriers:
+                carrier = np.ascontiguousarray(np.empty(n, dtype=np.float32))
+                self._cached_shape_carriers[n] = Tensor(
+                    storage=Buffer.from_dlpack(carrier).to(device)
+                )
+        h_carrier = self._cached_shape_carriers[packed_h]
+        w_carrier = self._cached_shape_carriers[packed_w]
+
+        kwargs = ZImageModelInputs.kwargs_from_context(ref)
+        kwargs["latents"] = latents_np
+        kwargs["sigmas"] = np.asarray(ref.sigmas)
+        kwargs["latent_image_ids"] = np.asarray(ref.latent_image_ids)
+
+        return ZImageModelInputs(
+            **kwargs,
+            do_cfg=False,
+            tokens_tensor=token_tensors[0],
+            txt_ids_tensor=txt_ids_tensor,
+            img_ids_tensor=img_ids_tensor,
+            latents_tensor=latents_tensor,
+            sigmas_tensor=sigmas_tensor,
+            h_carrier=h_carrier,
+            w_carrier=w_carrier,
+            batched_token_tensors=token_tensors,
+        )
+
     def create_cache_state(
         self,
         batch_size: int,
@@ -434,6 +585,8 @@ class ZImagePipeline(DiffusionPipeline):
             kwargs["txt_ids"],
             prev_residual=cache_state.prev_residual,
             prev_output=cache_state.prev_output,
+            txt_valid_length=kwargs.get("txt_valid_length"),
+            unified_valid_length=kwargs.get("unified_valid_length"),
         )
 
     def build_preprocess_latents(self) -> None:
@@ -603,6 +756,48 @@ class ZImagePipeline(DiffusionPipeline):
                 )
 
         return prompt_embeds
+
+    def _encode_batched_prompts(
+        self,
+        token_tensors: list[Tensor],
+        num_images_per_prompt: int,
+    ) -> tuple[Tensor, list[int]]:
+        """Encode each request's prompt in isolation, right-pad to the batch's
+        max text length, broadcast to ``num_images``, and concatenate.
+
+        Returns ``([sum(num_images), txt_padded, hidden], per_row_real_lens)``.
+        Encoding each prompt separately (batch-1) guarantees no cross-prompt
+        contamination; the returned real lengths drive the padded-attention
+        mask that neutralizes the right-pad.
+        """
+        embeds: list[Tensor] = []
+        real_lens: list[int] = []
+        for tok in token_tensors:
+            e = self.text_encoder(tok)
+            if e.rank == 2:
+                e = F.unsqueeze(e, axis=0)
+            elif e.rank != 3:
+                raise ValueError(
+                    f"Unexpected prompt_embeds rank={e.rank}; expected 2 or 3."
+                )
+            embeds.append(e)
+            real_lens.append(int(e.shape[1]))
+
+        txt_padded = max(real_lens)
+        hidden = int(embeds[0].shape[2])
+        rows: list[Tensor] = []
+        per_row_real: list[int] = []
+        for e, rlen in zip(embeds, real_lens):
+            e = self._align_prompt_seq_len(e, txt_padded)
+            if num_images_per_prompt > 1:
+                e = F.broadcast_to(
+                    e, [num_images_per_prompt, txt_padded, hidden]
+                )
+            rows.append(e)
+            per_row_real.extend([rlen] * num_images_per_prompt)
+
+        prompt_embeds = rows[0] if len(rows) == 1 else F.concat(rows, axis=0)
+        return prompt_embeds, per_row_real
 
     @staticmethod
     def _select_tokens_for_text_encoder(
@@ -1070,26 +1265,36 @@ class ZImagePipeline(DiffusionPipeline):
         """Run the Z-Image denoising loop and decode outputs."""
 
         # 1) Encode prompt embeddings.
+        per_row_real_txt: list[int] | None = None
+        negative_prompt_embeds: Tensor | None = None
         with Tracer("prepare_prompt_embeddings"):
-            prompt_embeds = self.prepare_prompt_embeddings(
-                tokens=model_inputs.tokens_tensor,
-                num_images_per_prompt=model_inputs.num_images_per_prompt,
-            )
-
-            negative_prompt_embeds: Tensor | None = None
-            if (
-                model_inputs.do_cfg
-                and model_inputs.negative_tokens_tensor is not None
-            ):
-                negative_prompt_embeds = self.prepare_prompt_embeddings(
-                    tokens=model_inputs.negative_tokens_tensor,
+            if model_inputs.batched_token_tensors is not None:
+                # Masked dynamic-batch path: encode each request in isolation
+                # (no cross-prompt contamination), right-pad embeddings to the
+                # batch's max text length, broadcast to num_images, concat. The
+                # per-row real lengths drive the padded-attention mask.
+                prompt_embeds, per_row_real_txt = self._encode_batched_prompts(
+                    model_inputs.batched_token_tensors,
+                    model_inputs.num_images_per_prompt,
+                )
+            else:
+                prompt_embeds = self.prepare_prompt_embeddings(
+                    tokens=model_inputs.tokens_tensor,
                     num_images_per_prompt=model_inputs.num_images_per_prompt,
                 )
-                if not model_inputs.explicit_negative_prompt:
-                    negative_prompt_embeds = self._align_prompt_seq_len(
-                        negative_prompt_embeds,
-                        int(prompt_embeds.shape[1]),
+                if (
+                    model_inputs.do_cfg
+                    and model_inputs.negative_tokens_tensor is not None
+                ):
+                    negative_prompt_embeds = self.prepare_prompt_embeddings(
+                        tokens=model_inputs.negative_tokens_tensor,
+                        num_images_per_prompt=model_inputs.num_images_per_prompt,
                     )
+                    if not model_inputs.explicit_negative_prompt:
+                        negative_prompt_embeds = self._align_prompt_seq_len(
+                            negative_prompt_embeds,
+                            int(prompt_embeds.shape[1]),
+                        )
 
         dtype = prompt_embeds.dtype
         latents = model_inputs.latents_tensor
@@ -1117,6 +1322,34 @@ class ZImagePipeline(DiffusionPipeline):
         latents = self.preprocess_latents(latents, dtype)
 
         image_seq_len = int(latents.shape[1])
+
+        # Dynamic-batching per-row valid lengths. In the batched path they mask
+        # each request's pad text keys (right-padded to the batch max); for a
+        # single request under a dynamic-batching build they equal the full
+        # length (padded kernel with full valid == unmasked). Only built when
+        # the graph was compiled with the padded-attention inputs.
+        txt_valid_length: Tensor | None = None
+        unified_valid_length: Tensor | None = None
+        if bool(getattr(self.transformer.config, "dynamic_batching", False)):
+            if per_row_real_txt is not None:
+                real_lens_np = np.asarray(per_row_real_txt, dtype=np.uint32)
+            else:
+                real_lens_np = np.full(
+                    (batch_size,), int(prompt_embeds.shape[1]), dtype=np.uint32
+                )
+            txt_valid_np = np.ascontiguousarray(real_lens_np)
+            unified_valid_np = np.ascontiguousarray(
+                (real_lens_np.astype(np.int64) + image_seq_len).astype(
+                    np.uint32
+                )
+            )
+            txt_valid_length = Tensor(
+                storage=Buffer.from_dlpack(txt_valid_np).to(device)
+            )
+            unified_valid_length = Tensor(
+                storage=Buffer.from_dlpack(unified_valid_np).to(device)
+            )
+
         cache_pos = self.create_cache_state(
             batch_size,
             image_seq_len,
@@ -1190,6 +1423,8 @@ class ZImagePipeline(DiffusionPipeline):
                             timestep=timestep,
                             img_ids=img_ids,
                             txt_ids=txt_ids,
+                            txt_valid_length=txt_valid_length,
+                            unified_valid_length=unified_valid_length,
                         )
 
                     if apply_cfg:
@@ -1216,6 +1451,8 @@ class ZImagePipeline(DiffusionPipeline):
                                 timestep=timestep,
                                 img_ids=neg_img_ids,
                                 txt_ids=neg_txt_ids,
+                                txt_valid_length=txt_valid_length,
+                                unified_valid_length=unified_valid_length,
                             )
                         pos_noise_pred = noise_pred
                         noise_delta = F.sub(noise_pred, neg_noise_pred)

@@ -93,6 +93,7 @@ class ZImageTransformerBlock(Module[..., Tensor]):
         x: Tensor,
         freqs_cis: tuple[Tensor, Tensor],
         adaln_input: Tensor | None = None,
+        valid_length: Tensor | None = None,
     ) -> Tensor:
         if self.modulation:
             if adaln_input is None:
@@ -112,6 +113,7 @@ class ZImageTransformerBlock(Module[..., Tensor]):
             attn_out = self.attention(
                 self.attention_norm1(x) * scale_msa,
                 freqs_cis=freqs_cis,
+                valid_length=valid_length,
             )
             x = x + gate_msa * self.attention_norm2(attn_out)
 
@@ -119,7 +121,9 @@ class ZImageTransformerBlock(Module[..., Tensor]):
             x = x + gate_mlp * self.ffn_norm2(ffn_out)
         else:
             attn_out = self.attention(
-                self.attention_norm1(x), freqs_cis=freqs_cis
+                self.attention_norm1(x),
+                freqs_cis=freqs_cis,
+                valid_length=valid_length,
             )
             x = x + self.attention_norm2(attn_out)
             x = x + self.ffn_norm2(self.feed_forward(self.ffn_norm1(x)))
@@ -257,6 +261,12 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         self.max_device = config.device
         self.max_dtype = config.dtype
         self.cap_feat_dim = config.cap_feat_dim
+        # When enabled, the graph takes two extra per-row [batch] uint32 inputs
+        # (text valid-length for the context refiner, unified valid-length for
+        # the main layers) driving the padded-attention kernel so
+        # different-length prompts can be dynamically batched without pad
+        # contamination. See ``model_config.dynamic_batching``.
+        self.dynamic_batching = config.dynamic_batching
 
         self._forward_impl: Callable[..., tuple[Tensor, ...]] = (
             self._forward_standard
@@ -321,8 +331,25 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
             txt_ids_type,
         )
 
+    def _valid_length_input_types(self) -> tuple[TensorType, ...]:
+        """Per-row valid lengths for dynamic batching (empty when disabled).
+
+        Two [batch] uint32 tensors: text-only (context refiner) and unified
+        image+text (main layers), driving the padded-attention kernel. Always
+        appended LAST so the leading arg order is stable across the standard and
+        FBCache variants.
+        """
+        if not self.dynamic_batching:
+            return ()
+        valid_len_type = TensorType(
+            DType.uint32,
+            shape=["batch_size"],
+            device=self.max_device,
+        )
+        return (valid_len_type, valid_len_type)
+
     def _input_types_standard(self) -> tuple[TensorType, ...]:
-        return self._base_input_types()
+        return self._base_input_types() + self._valid_length_input_types()
 
     def _input_types_step_cache(self) -> tuple[TensorType, ...]:
         rdt_type = TensorType(DType.float32, shape=[], device=self.max_device)
@@ -330,6 +357,7 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
             self._base_input_types()
             + tuple(self._fbcache_conditional_execution_output_types())
             + (rdt_type,)
+            + self._valid_length_input_types()
         )
 
     def input_types(self) -> tuple[TensorType, ...]:
@@ -342,6 +370,7 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         timestep: Tensor,
         img_ids: Tensor,
         txt_ids: Tensor,
+        txt_valid_length: Tensor | None = None,
     ) -> tuple[Tensor, Any, Tensor, tuple[Tensor, Tensor]]:
         """Embed inputs, run refiners, return unified seq before main ``layers[0]``."""
         x = self.x_embedder(hidden_states)
@@ -361,11 +390,13 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
             F.concat([img_freqs[1], txt_freqs[1]], axis=0),
         )
 
+        # Image tokens are never padded (fixed per resolution) -> no mask.
         for layer in self.noise_refiner:
             x = layer(x, freqs_cis=img_freqs, adaln_input=t_emb)
 
+        # Text may be right-padded to the batch's max length -> mask pad keys.
         for layer in self.context_refiner:
-            cap = layer(cap, freqs_cis=txt_freqs)
+            cap = layer(cap, freqs_cis=txt_freqs, valid_length=txt_valid_length)
 
         img_len = x.shape[1]
         unified0 = F.concat([x, cap], axis=1)
@@ -376,11 +407,13 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         unified0: Tensor,
         t_emb: Tensor,
         unified_freqs: tuple[Tensor, Tensor],
+        unified_valid_length: Tensor | None = None,
     ) -> Tensor:
         return self.layers[0](
             unified0,
             freqs_cis=unified_freqs,
             adaln_input=t_emb,
+            valid_length=unified_valid_length,
         )
 
     def _run_remaining_after_first(
@@ -390,6 +423,7 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         img_len: Any,
         t_emb: Tensor,
         freqs_cis: tuple[Tensor, Tensor],
+        unified_valid_length: Tensor | None = None,
     ) -> Tensor:
         u = unified
         for i in range(1, len(self.layers)):
@@ -397,6 +431,7 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
                 u,
                 freqs_cis=freqs_cis,
                 adaln_input=t_emb,
+                valid_length=unified_valid_length,
             )
         return u[:, :img_len, :]
 
@@ -410,19 +445,25 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids = args[
             :5
         ]
+        txt_valid = args[-2] if self.dynamic_batching else None
+        unified_valid = args[-1] if self.dynamic_batching else None
         unified0, img_len, t_emb, unified_freqs = self._forward_preamble(
             hidden_states,
             encoder_hidden_states,
             timestep,
             img_ids,
             txt_ids,
+            txt_valid_length=txt_valid,
         )
-        u1 = self._run_first_main_layer(unified0, t_emb, unified_freqs)
+        u1 = self._run_first_main_layer(
+            unified0, t_emb, unified_freqs, unified_valid_length=unified_valid
+        )
         remaining = self._run_remaining_after_first(
             u1,
             img_len=img_len,
             t_emb=t_emb,
             freqs_cis=unified_freqs,
+            unified_valid_length=unified_valid,
         )
         return (self._forward_postamble(remaining, t_emb),)
 
@@ -436,15 +477,20 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
             prev_residual,
             prev_output,
             residual_threshold,
-        ) = args
+        ) = args[:8]
+        txt_valid = args[-2] if self.dynamic_batching else None
+        unified_valid = args[-1] if self.dynamic_batching else None
         unified0, img_len, t_emb, unified_freqs = self._forward_preamble(
             hidden_states,
             encoder_hidden_states,
             timestep,
             img_ids,
             txt_ids,
+            txt_valid_length=txt_valid,
         )
-        unified1 = self._run_first_main_layer(unified0, t_emb, unified_freqs)
+        unified1 = self._run_first_main_layer(
+            unified0, t_emb, unified_freqs, unified_valid_length=unified_valid
+        )
         first_block_residual = (
             unified1[:, :img_len, :] - unified0[:, :img_len, :]
         )
@@ -460,6 +506,7 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
                 img_len=img_len,
                 t_emb=t_emb,
                 freqs_cis=unified_freqs,
+                unified_valid_length=unified_valid,
             ),
             self._forward_postamble,
             t_emb,

@@ -11,6 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+import os
 from typing import Any
 
 from max.driver import Device
@@ -43,6 +44,11 @@ class ZImageConfig(MAXModelConfigBase):
     # When True the main transformer blocks (attention + FF + adaLN) use the
     # native NVFP4 W4A4 path; activations stay bf16 (dynamic-quantized in-kernel).
     quantize_nvfp4: bool = False
+    # When True the transformer graph adds per-row valid_length inputs and uses
+    # the padded-attention kernel, so requests with different-length prompts can
+    # be dynamically batched (pad text keys are masked). Enabled iff
+    # MODULAR_PIXEL_MAX_BATCH_SIZE > 1; keeps the default graph byte-identical.
+    dynamic_batching: bool = False
 
     @classmethod
     def initialize_from_config(
@@ -60,6 +66,10 @@ class ZImageConfig(MAXModelConfigBase):
         init_dict.pop("siglip_feat_dim", None)
 
         is_nvfp4 = encoding == "float4_e2m1fnx2"
+        try:
+            max_batch = int(os.environ.get("MODULAR_PIXEL_MAX_BATCH_SIZE", "1"))
+        except ValueError:
+            max_batch = 1
         init_dict.update(
             {
                 # NVFP4 keeps bf16 activations; the fp4 weights are declared by
@@ -71,6 +81,7 @@ class ZImageConfig(MAXModelConfigBase):
                 ),
                 "device": DeviceRef.from_device(devices[0]),
                 "quantize_nvfp4": is_nvfp4,
+                "dynamic_batching": max_batch > 1,
             }
         )
         return cls(**init_dict)

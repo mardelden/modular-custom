@@ -225,6 +225,13 @@ class PixelGenerationPipeline(
             and getattr(self._executor, "supports_dynamic_batching", False)
         ):
             return requested
+        if (
+            self._pipeline_model is not None
+            and getattr(
+                self._pipeline_model, "supports_dynamic_batching", False
+            )
+        ):
+            return requested
         return 1
 
     def execute(
@@ -383,10 +390,19 @@ class PixelGenerationPipeline(
         # compatibility and returns images in this flattened order.
         flat_batch = list(batch.items())
 
+        pipeline_model_batches = (
+            self._pipeline_model is not None
+            and getattr(
+                self._pipeline_model, "supports_dynamic_batching", False
+            )
+        )
         if len(flat_batch) > 1 and not (
-            self._use_executor
-            and self._executor is not None
-            and getattr(self._executor, "supports_dynamic_batching", False)
+            (
+                self._use_executor
+                and self._executor is not None
+                and getattr(self._executor, "supports_dynamic_batching", False)
+            )
+            or pipeline_model_batches
         ):
             raise ValueError(
                 "Batching of different requests is not supported for this "
@@ -401,6 +417,12 @@ class PixelGenerationPipeline(
             assert self._executor is not None
             contexts = [ctx for _rid, ctx in flat_batch]
             model_inputs = self._executor.prepare_inputs(contexts)
+        elif pipeline_model_batches:
+            # Pixel pipeline-model that opts into dynamic batching (e.g.
+            # Z-Image): hand it the full compatible group as a list.
+            assert self._pipeline_model is not None
+            contexts = [ctx for _rid, ctx in flat_batch]
+            model_inputs = self._pipeline_model.prepare_inputs_batched(contexts)
         else:
             assert self._pipeline_model is not None
             model_inputs = self._pipeline_model.prepare_inputs(flat_batch[0][1])
