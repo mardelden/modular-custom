@@ -174,7 +174,7 @@ class ZImageModelInputs:
 
     When set, ``execute`` encodes each separately, right-pads the embeddings to
     the batch's max text length, broadcasts to ``num_images_per_prompt``, and
-    concatenates -- with per-row ``valid_length`` masking the pad text keys. The
+    concatenates -- with per-row additive key masks masking the pad text keys. The
     concatenated per-context latents live in ``latents_tensor`` and
     ``txt_ids_tensor`` / ``img_ids_tensor`` are already sized to the padded
     text length.
@@ -436,7 +436,7 @@ class ZImagePipeline(DiffusionPipeline):
         """Collate multiple compatible requests into one masked batch.
 
         Different-length prompts are right-padded to the batch's max text
-        length; the per-row ``valid_length`` built in :meth:`execute` masks the
+        length; the per-row additive key masks built in :meth:`execute` mask the
         pad text keys so each request's output is independent of its batch
         neighbors. Latents/num_images are concatenated in ``contexts`` order to
         match the base pipeline's per-request output split.
@@ -609,8 +609,8 @@ class ZImagePipeline(DiffusionPipeline):
             kwargs["txt_ids"],
             prev_residual=cache_state.prev_residual,
             prev_output=cache_state.prev_output,
-            txt_valid_length=kwargs.get("txt_valid_length"),
-            unified_valid_length=kwargs.get("unified_valid_length"),
+            txt_attn_mask=kwargs.get("txt_attn_mask"),
+            unified_attn_mask=kwargs.get("unified_attn_mask"),
         )
 
     def build_preprocess_latents(self) -> None:
@@ -1393,31 +1393,35 @@ class ZImagePipeline(DiffusionPipeline):
 
         image_seq_len = int(latents.shape[1])
 
-        # Dynamic-batching per-row valid lengths. In the batched path they mask
-        # each request's pad text keys (right-padded to the batch max); for a
-        # single request under a dynamic-batching build they equal the full
-        # length (padded kernel with full valid == unmasked). Only built when
-        # the graph was compiled with the padded-attention inputs.
-        txt_valid_length: Tensor | None = None
-        unified_valid_length: Tensor | None = None
+        # Dynamic-batching per-row additive key masks. Text is right-padded to
+        # the batch's max length; these mask each request's pad TEXT keys (0 for
+        # real positions, large-negative for pad) so its attention -- and thus
+        # its result -- is independent of batch neighbors. For a single request
+        # under a dynamic-batching build there is no padding, so the masks are
+        # all-zero (a no-op). Built only when the graph has the mask inputs.
+        txt_attn_mask: Tensor | None = None
+        unified_attn_mask: Tensor | None = None
         if bool(getattr(self.transformer.config, "dynamic_batching", False)):
+            txt_padded = int(prompt_embeds.shape[1])
             if per_row_real_txt is not None:
-                real_lens_np = np.asarray(per_row_real_txt, dtype=np.uint32)
+                real = list(per_row_real_txt)
             else:
-                real_lens_np = np.full(
-                    (batch_size,), int(prompt_embeds.shape[1]), dtype=np.uint32
-                )
-            txt_valid_np = np.ascontiguousarray(real_lens_np)
-            unified_valid_np = np.ascontiguousarray(
-                (real_lens_np.astype(np.int64) + image_seq_len).astype(
-                    np.uint32
-                )
+                real = [txt_padded] * batch_size
+            neg = np.float32(-1e9)
+            txt_mask_np = np.zeros((batch_size, txt_padded), dtype=np.float32)
+            uni_len = image_seq_len + txt_padded
+            uni_mask_np = np.zeros((batch_size, uni_len), dtype=np.float32)
+            for r, rlen in enumerate(real):
+                if rlen < txt_padded:
+                    txt_mask_np[r, rlen:] = neg
+                    uni_mask_np[r, image_seq_len + rlen :] = neg
+            txt_mask_np = np.ascontiguousarray(txt_mask_np)
+            uni_mask_np = np.ascontiguousarray(uni_mask_np)
+            txt_attn_mask = Tensor(
+                storage=Buffer.from_dlpack(txt_mask_np).to(device)
             )
-            txt_valid_length = Tensor(
-                storage=Buffer.from_dlpack(txt_valid_np).to(device)
-            )
-            unified_valid_length = Tensor(
-                storage=Buffer.from_dlpack(unified_valid_np).to(device)
+            unified_attn_mask = Tensor(
+                storage=Buffer.from_dlpack(uni_mask_np).to(device)
             )
 
         cache_pos = self.create_cache_state(
@@ -1493,8 +1497,8 @@ class ZImagePipeline(DiffusionPipeline):
                             timestep=timestep,
                             img_ids=img_ids,
                             txt_ids=txt_ids,
-                            txt_valid_length=txt_valid_length,
-                            unified_valid_length=unified_valid_length,
+                            txt_attn_mask=txt_attn_mask,
+                            unified_attn_mask=unified_attn_mask,
                         )
 
                     if apply_cfg:
@@ -1521,8 +1525,8 @@ class ZImagePipeline(DiffusionPipeline):
                                 timestep=timestep,
                                 img_ids=neg_img_ids,
                                 txt_ids=neg_txt_ids,
-                                txt_valid_length=txt_valid_length,
-                                unified_valid_length=unified_valid_length,
+                                txt_attn_mask=txt_attn_mask,
+                                unified_attn_mask=unified_attn_mask,
                             )
                         pos_noise_pred = noise_pred
                         noise_delta = F.sub(noise_pred, neg_noise_pred)

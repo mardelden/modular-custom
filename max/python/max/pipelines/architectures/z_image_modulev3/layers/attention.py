@@ -20,11 +20,15 @@ from max.experimental.nn.sequential import ModuleList
 from max.experimental.tensor import Tensor
 from max.nn.attention.mask_config import MHAMaskVariant
 from max.nn.kernels import flash_attention_gpu as _flash_attention_gpu
+from max.nn.kernels import (
+    masked_flash_attention_gpu as _masked_flash_attention_gpu,
+)
 
 from .embeddings import apply_rotary_emb
 from .quant_linear import NVFP4Linear
 
 flash_attention_gpu = F.functional(_flash_attention_gpu)
+masked_flash_attention_gpu = F.functional(_masked_flash_attention_gpu)
 
 
 class ZImageAttention(Module[..., Tensor]):
@@ -55,7 +59,7 @@ class ZImageAttention(Module[..., Tensor]):
         self,
         hidden_states: Tensor,
         freqs_cis: tuple[Tensor, Tensor],
-        valid_length: Tensor | None = None,
+        attn_mask: Tensor | None = None,
     ) -> Tensor:
         batch_size = hidden_states.shape[0]
         seq_len = hidden_states.shape[1]
@@ -94,19 +98,28 @@ class ZImageAttention(Module[..., Tensor]):
         query = query.cast(value.dtype)
         key = key.cast(value.dtype)
 
-        # ``valid_length`` (per-row [batch] uint32) selects the padded-attention
-        # kernel so pad key positions (right-padded text in a dynamically
-        # batched request) are excluded from every query's softmax. When None
-        # (single-request / non-batched path) this is the plain NULL_MASK
-        # kernel — byte-identical to the unbatched behavior.
-        out = flash_attention_gpu(
-            query,
-            key,
-            value,
-            mask_variant=MHAMaskVariant.NULL_MASK,
-            scale=math.sqrt(1.0 / float(self.head_dim)),
-            valid_length=valid_length,
-        )
+        scale = math.sqrt(1.0 / float(self.head_dim))
+        if attn_mask is None:
+            # Single-request / non-batched path: plain NULL_MASK kernel,
+            # byte-identical to the unbatched behavior.
+            out = flash_attention_gpu(
+                query,
+                key,
+                value,
+                mask_variant=MHAMaskVariant.NULL_MASK,
+                scale=scale,
+            )
+        else:
+            # Dynamic-batch path: ``attn_mask`` is a per-row additive key mask
+            # of shape [batch, kv_seq] (0 for real positions, large negative
+            # for right-padded text keys). Broadcast to a [batch, q_seq, kv_seq]
+            # additive mask so each query excludes pad keys from its softmax --
+            # this fully isolates a request from its batch neighbors (a pure
+            # key-padding mask, unlike the ragged valid_length kernel).
+            mask = F.unsqueeze(attn_mask, 1)
+            mask = F.broadcast_to(mask, [batch_size, seq_len, seq_len])
+            mask = mask.cast(value.dtype)
+            out = masked_flash_attention_gpu(query, key, value, mask, scale=scale)
 
         out = F.reshape(out, [batch_size, seq_len, self.inner_dim])
         return self.to_out[0](out)

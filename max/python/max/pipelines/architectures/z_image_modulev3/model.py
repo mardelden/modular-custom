@@ -110,8 +110,8 @@ class ZImageTransformerModel(ComponentModel):
         controlnet_block_samples: Tensor | None = None,
         siglip_feats: Tensor | None = None,
         image_noise_mask: Tensor | None = None,
-        txt_valid_length: Tensor | None = None,
-        unified_valid_length: Tensor | None = None,
+        txt_attn_mask: Tensor | None = None,
+        unified_attn_mask: Tensor | None = None,
     ) -> Any:
         if controlnet_block_samples is not None:
             raise NotImplementedError(
@@ -142,12 +142,12 @@ class ZImageTransformerModel(ComponentModel):
                 residual_threshold,
             )
         # Dynamic-batching valid lengths are appended LAST, matching
-        # ``ZImageTransformer2DModel._valid_length_input_types`` ordering.
+        # ``ZImageTransformer2DModel._attn_mask_input_types`` ordering.
         if self.config.dynamic_batching:
-            if txt_valid_length is None or unified_valid_length is None:
+            if txt_attn_mask is None or unified_attn_mask is None:
                 raise ValueError(
-                    "dynamic_batching graph requires txt_valid_length and "
-                    "unified_valid_length"
+                    "dynamic_batching graph requires txt_attn_mask and "
+                    "unified_attn_mask"
                 )
-            model_args = (*model_args, txt_valid_length, unified_valid_length)
+            model_args = (*model_args, txt_attn_mask, unified_attn_mask)
         return self.model(*model_args)
