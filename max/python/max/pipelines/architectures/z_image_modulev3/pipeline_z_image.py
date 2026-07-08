@@ -1020,7 +1020,11 @@ class ZImagePipeline(DiffusionPipeline):
         if vae_batch > _VAE_DECODE_MAX_BATCH:
             parts: list[Tensor] = []
             for start in range(0, vae_batch, _VAE_DECODE_MAX_BATCH):
-                chunk = latents[start : start + _VAE_DECODE_MAX_BATCH]
+                # Clamp the end so the last chunk doesn't overshoot when
+                # vae_batch isn't a multiple of _VAE_DECODE_MAX_BATCH (e.g. a
+                # scheduler group of 7).
+                end = min(start + _VAE_DECODE_MAX_BATCH, vae_batch)
+                chunk = latents[start:end]
                 parts.append(self.vae.decode(chunk))
             decoded: Tensor = F.concat(parts, axis=0)
         else:
