@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from max.graph.weights import WeightData
 
+from .nvfp4_weight_adapter import convert_z_image_nvfp4_state_dict
+
 
 def _replace_prefix(key: str, old: str, new: str) -> str:
     if key.startswith(old):
@@ -25,6 +27,11 @@ def _replace_prefix(key: str, old: str, new: str) -> str:
 def convert_z_image_transformer_state_dict(
     state_dict: dict[str, WeightData],
 ) -> dict[str, WeightData]:
+    # NVFP4 (ComfyUI) checkpoints carry per-Linear ``.weight_scale`` tensors and
+    # a fused ``.attention.qkv``; route them through the NVFP4 adapter.
+    if any(k.endswith(".weight_scale") for k in state_dict):
+        return convert_z_image_nvfp4_state_dict(state_dict)
+
     converted: dict[str, WeightData] = {}
 
     dropped_prefixes = (

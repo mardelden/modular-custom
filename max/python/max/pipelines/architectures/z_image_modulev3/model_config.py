@@ -40,6 +40,9 @@ class ZImageConfig(MAXModelConfigBase):
     axes_lens: tuple[int, ...] = (1024, 512, 512)
     dtype: DType = DType.bfloat16
     device: DeviceRef = Field(default_factory=DeviceRef.GPU)
+    # When True the main transformer blocks (attention + FF + adaLN) use the
+    # native NVFP4 W4A4 path; activations stay bf16 (dynamic-quantized in-kernel).
+    quantize_nvfp4: bool = False
 
     @classmethod
     def initialize_from_config(
@@ -56,10 +59,18 @@ class ZImageConfig(MAXModelConfigBase):
         # Ignore omni-only fields in phase 1 (may appear in full checkpoints).
         init_dict.pop("siglip_feat_dim", None)
 
+        is_nvfp4 = encoding == "float4_e2m1fnx2"
         init_dict.update(
             {
-                "dtype": supported_encoding_dtype(encoding),
+                # NVFP4 keeps bf16 activations; the fp4 weights are declared by
+                # the quantized Linears, not by the compute dtype.
+                "dtype": (
+                    DType.bfloat16
+                    if is_nvfp4
+                    else supported_encoding_dtype(encoding)
+                ),
                 "device": DeviceRef.from_device(devices[0]),
+                "quantize_nvfp4": is_nvfp4,
             }
         )
         return cls(**init_dict)

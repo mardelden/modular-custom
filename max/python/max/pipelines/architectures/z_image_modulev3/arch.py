@@ -52,7 +52,7 @@ z_image_arch = SupportedArchitecture(
     name="ZImagePipeline",
     task=PipelineTask.PIXEL_GENERATION,
     default_encoding="bfloat16",
-    supported_encodings={"bfloat16"},
+    supported_encodings={"bfloat16", "float4_e2m1fnx2"},
     example_repo_ids=[
         "Tongyi-MAI/Z-Image",
         "Tongyi-MAI/Z-Image-Turbo",

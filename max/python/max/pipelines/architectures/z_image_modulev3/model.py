@@ -17,6 +17,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from max.driver import Device
+from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
 from max.graph.weights import Weights
@@ -63,12 +64,23 @@ class ZImageTransformerModel(ComponentModel):
     @traced(message="ZImageTransformerModel.load_model")
     def load_model(self) -> None:
         target_dtype = self.config.dtype
+        # NVFP4 quant tensors must keep their on-disk dtype (uint8 packed fp4,
+        # float8_e4m3 block scales, float32 per-tensor scales) — do NOT cast
+        # them to the bf16 compute dtype.
+        _QUANT_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
         state_dict = {}
         for key, value in self.weights.items():
             weight = value.data()
-            if weight.dtype != target_dtype:
-                if weight.dtype.is_float() and target_dtype.is_float():
-                    weight = weight.astype(target_dtype)
+            is_quant = key.endswith(_QUANT_SUFFIXES) or (
+                key.endswith(".weight") and weight.dtype == DType.uint8
+            )
+            if (
+                not is_quant
+                and weight.dtype != target_dtype
+                and weight.dtype.is_float()
+                and target_dtype.is_float()
+            ):
+                weight = weight.astype(target_dtype)
             state_dict[key] = weight
         state_dict = convert_z_image_transformer_state_dict(state_dict)
 

@@ -22,6 +22,7 @@ from max.nn.attention.mask_config import MHAMaskVariant
 from max.nn.kernels import flash_attention_gpu as _flash_attention_gpu
 
 from .embeddings import apply_rotary_emb
+from .quant_linear import NVFP4Linear
 
 flash_attention_gpu = F.functional(_flash_attention_gpu)
 
@@ -33,20 +34,22 @@ class ZImageAttention(Module[..., Tensor]):
         n_heads: int,
         qk_norm: bool,
         eps: float,
+        quantize: bool = False,
     ):
         self.head_dim = dim // n_heads
         self.inner_dim = dim
         self.n_heads = n_heads
 
-        self.to_q = Linear(dim, dim, bias=False)
-        self.to_k = Linear(dim, dim, bias=False)
-        self.to_v = Linear(dim, dim, bias=False)
+        proj = NVFP4Linear if quantize else Linear
+        self.to_q = proj(dim, dim, bias=False)
+        self.to_k = proj(dim, dim, bias=False)
+        self.to_v = proj(dim, dim, bias=False)
 
         self.norm_q = RMSNorm(self.head_dim, eps=eps) if qk_norm else None
         self.norm_k = RMSNorm(self.head_dim, eps=eps) if qk_norm else None
 
         # Keep ModuleList naming for diffusers-compatible key loading.
-        self.to_out = ModuleList([Linear(dim, dim, bias=False)])
+        self.to_out = ModuleList([proj(dim, dim, bias=False)])
 
     def forward(
         self,

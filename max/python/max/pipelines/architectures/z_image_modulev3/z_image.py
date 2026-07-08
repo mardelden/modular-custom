@@ -30,16 +30,18 @@ from max.pipelines.diffusion.cache import (
 
 from .layers.attention import ZImageAttention
 from .layers.embeddings import RopeEmbedder, TimestepEmbedder
+from .layers.quant_linear import NVFP4Linear
 from .model_config import ZImageConfig
 
 ADALN_EMBED_DIM = 256
 
 
 class FeedForward(Module[[Tensor], Tensor]):
-    def __init__(self, dim: int, hidden_dim: int):
-        self.w1 = Linear(dim, hidden_dim, bias=False)
-        self.w2 = Linear(hidden_dim, dim, bias=False)
-        self.w3 = Linear(dim, hidden_dim, bias=False)
+    def __init__(self, dim: int, hidden_dim: int, quantize: bool = False):
+        proj = NVFP4Linear if quantize else Linear
+        self.w1 = proj(dim, hidden_dim, bias=False)
+        self.w2 = proj(hidden_dim, dim, bias=False)
+        self.w3 = proj(dim, hidden_dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -55,6 +57,7 @@ class ZImageTransformerBlock(Module[..., Tensor]):
         norm_eps: float,
         qk_norm: bool,
         modulation: bool = True,
+        quantize: bool = False,
     ):
         del n_kv_heads
 
@@ -66,8 +69,11 @@ class ZImageTransformerBlock(Module[..., Tensor]):
             n_heads=n_heads,
             qk_norm=qk_norm,
             eps=norm_eps,
+            quantize=quantize,
         )
-        self.feed_forward = FeedForward(dim=dim, hidden_dim=int(dim / 3 * 8))
+        self.feed_forward = FeedForward(
+            dim=dim, hidden_dim=int(dim / 3 * 8), quantize=quantize
+        )
 
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
@@ -75,8 +81,9 @@ class ZImageTransformerBlock(Module[..., Tensor]):
         self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
 
+        adaln_proj = NVFP4Linear if quantize else Linear
         self.adaLN_modulation = (
-            Linear(min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True)
+            adaln_proj(min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True)
             if modulation
             else None
         )
@@ -218,6 +225,8 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
         self.cap_norm = RMSNorm(config.cap_feat_dim, eps=config.norm_eps)
         self.cap_proj = Linear(config.cap_feat_dim, self.dim, bias=True)
 
+        # Only the main blocks are NVFP4-quantized (the refiners stay bf16,
+        # matching the ComfyUI checkpoint's uniform-NVFP4 layer selection).
         self.layers: ModuleList[ZImageTransformerBlock] = ModuleList(
             [
                 ZImageTransformerBlock(
@@ -228,6 +237,7 @@ class ZImageTransformer2DModel(Module[..., Sequence[Tensor]]):
                     config.norm_eps,
                     config.qk_norm,
                     modulation=True,
+                    quantize=config.quantize_nvfp4,
                 )
                 for layer_id in range(config.n_layers)
             ]
