@@ -55,17 +55,17 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# Spatial VAE-decode tiling (enables 4K+ without OOM; see
-# ..autoencoders_modulev3.tiling). All sizes are in LATENT pixels (image px =
-# latent px * vae_scale_factor, i.e. *8). Tiling auto-enables once a latent edge
-# exceeds the threshold, so resolutions that already fit (<=2K) are untouched
-# and byte-identical. MODULAR_VAE_ENABLE_TILING forces it on/off. Defaults are
-# provisional pending on-device seam/memory tuning.
+# Spatial VAE-decode tiling helper (..autoencoders_modulev3.tiling) decodes 4K+
+# latents in overlapping tiles without OOM. It is kept wired here but DISABLED
+# BY DEFAULT for Z-Image: Z-Image is ~2K-native, and true 4K needs a tiled
+# img2img *upscale* (native-resolution tiles refined by the model), not just a
+# tiled *decode* of a 4K latent, so auto-tiling the decode is not a useful
+# default. Set MODULAR_VAE_ENABLE_TILING=1 to force it on (testing / reuse); the
+# helper and its geometry knobs stay available. Sizes are in LATENT pixels
+# (image px = latent px * vae_scale_factor, i.e. *8).
 _VAE_TILE_SIZE = _env_int("MODULAR_VAE_TILE_SIZE", 256)
 _VAE_TILE_OVERLAP = _env_int("MODULAR_VAE_TILE_OVERLAP", 32)
-# 320 latent = 2560 image px; below this (<=2K) tiling stays off.
-_VAE_TILE_THRESHOLD = _env_int("MODULAR_VAE_TILE_THRESHOLD", 320)
-# None => auto (threshold-gated); "1"/"0" => force on/off.
+# None => disabled (default); "1"/"0" => force on/off.
 _VAE_TILE_FORCE = os.environ.get("MODULAR_VAE_ENABLE_TILING")
 
 
@@ -1007,21 +1007,20 @@ class ZImagePipeline(DiffusionPipeline):
 
     @traced(message="ZImagePipeline.decode_latents")
     def _vae_decode_maybe_tiled(self, latents: Tensor) -> Tensor:
-        """VAE-decode a spatial NCHW latent, tiling for high resolutions.
+        """VAE-decode a spatial NCHW latent, optionally in overlapping tiles.
 
-        Below the size threshold this is a plain ``self.vae.decode`` (the
-        non-tiled path stays byte-identical); above it (or when forced), decode
-        in overlapping spatial tiles and feather-blend so 4K+ fits without OOM
-        (see ``..autoencoders_modulev3.tiling.tiled_decode``). Gated on latent
-        edge size so resolutions that already fit are unaffected.
+        Tiling is **disabled by default** for Z-Image (plain ``self.vae.decode``,
+        byte-identical). It is opt-in via ``MODULAR_VAE_ENABLE_TILING=1``, which
+        decodes in overlapping spatial tiles and feather-blends so 4K+ fits
+        without OOM (see ``..autoencoders_modulev3.tiling.tiled_decode``). The
+        helper is kept wired for reuse/testing; see the module-level note on why
+        auto-tiling the decode is not a useful default for a ~2K-native model.
         """
-        h, w = int(latents.shape[2]), int(latents.shape[3])
-        if _VAE_TILE_FORCE is not None:
-            enabled = _VAE_TILE_FORCE.strip().lower() in (
-                "1", "true", "yes", "on",
-            )
-        else:
-            enabled = max(h, w) > _VAE_TILE_THRESHOLD
+        enabled = (
+            _VAE_TILE_FORCE.strip().lower() in ("1", "true", "yes", "on")
+            if _VAE_TILE_FORCE is not None
+            else False  # disabled by default for Z-Image; opt-in via env
+        )
         if not enabled:
             return self.vae.decode(latents)
         return tiled_decode(
