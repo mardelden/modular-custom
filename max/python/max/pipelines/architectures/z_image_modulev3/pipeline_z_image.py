@@ -1416,6 +1416,11 @@ class ZImagePipeline(DiffusionPipeline):
                 real = list(per_row_real_txt)
             else:
                 real = [txt_padded] * batch_size
+            # DEBUG: mask the last K *real* text tokens to test whether the
+            # additive mask is actually applied by masked_flash_attention_gpu.
+            _mask_last = int(os.environ.get("ZIMAGE_DEBUG_MASK_LAST", "0"))
+            if _mask_last > 0:
+                real = [max(1, r - _mask_last) for r in real]
             neg = np.float32(-1e9)
             txt_mask_np = np.zeros((batch_size, txt_padded), dtype=np.float32)
             uni_len = image_seq_len + txt_padded
