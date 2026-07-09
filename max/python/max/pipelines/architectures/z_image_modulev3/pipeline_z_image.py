@@ -457,7 +457,10 @@ class ZImagePipeline(DiffusionPipeline):
             raise ValueError(
                 "prepare_inputs_batched requires at least one context"
             )
-        if len(contexts) == 1:
+        # DEBUG: with ZIMAGE_DEBUG_PAD_TO set, route even a single request
+        # through the padded batched path so we can measure length-dependence.
+        _debug_pad_to = int(os.environ.get("ZIMAGE_DEBUG_PAD_TO", "0"))
+        if len(contexts) == 1 and _debug_pad_to <= 0:
             return self.prepare_inputs(contexts[0])
 
         ref = contexts[0]
@@ -501,6 +504,8 @@ class ZImagePipeline(DiffusionPipeline):
                 self._token_tensor_from_numpy(toks_np, text_device)
             )
         txt_padded = max(real_lens)
+        if _debug_pad_to > txt_padded:  # DEBUG length-dependence test
+            txt_padded = _debug_pad_to
 
         # Concatenate per-context latents -> [sum(num_images), C, H, W].
         latents_np = np.ascontiguousarray(
@@ -817,6 +822,11 @@ class ZImagePipeline(DiffusionPipeline):
             real_lens.append(int(e.shape[1]))
 
         txt_padded = max(real_lens)
+        # DEBUG: force a larger padded length to test length-dependence of the
+        # attention (pad content is masked; only the sequence length changes).
+        _pad_to = int(os.environ.get("ZIMAGE_DEBUG_PAD_TO", "0"))
+        if _pad_to > txt_padded:
+            txt_padded = _pad_to
         hidden = int(embeds[0].shape[2])
         rows: list[Tensor] = []
         per_row_real: list[int] = []
