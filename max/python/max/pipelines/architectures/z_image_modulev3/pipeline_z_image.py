@@ -21,6 +21,7 @@ tracing, module docstrings, and flat weight path assignment.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import MISSING, dataclass, field, fields
 from typing import Any, Literal
 
@@ -37,6 +38,7 @@ from max.pipelines.diffusion.interface import DiffusionPipeline, max_compile
 from max.profiler import Tracer, traced
 
 from ..autoencoders import AutoencoderKLModel
+from ..autoencoders_modulev3.tiling import tiled_decode
 from ..qwen3_modulev3.text_encoder import Qwen3TextEncoderZImageModel
 from .model import ZImageTransformerModel
 
@@ -44,6 +46,27 @@ from .model import ZImageTransformerModel
 # batch >= 8; decode in chunks no larger than this (works for num_images and
 # dynamic batching alike). 4 leaves margin under the observed limit of 7.
 _VAE_DECODE_MAX_BATCH = 4
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+# Spatial VAE-decode tiling (enables 4K+ without OOM; see
+# ..autoencoders_modulev3.tiling). All sizes are in LATENT pixels (image px =
+# latent px * vae_scale_factor, i.e. *8). Tiling auto-enables once a latent edge
+# exceeds the threshold, so resolutions that already fit (<=2K) are untouched
+# and byte-identical. MODULAR_VAE_ENABLE_TILING forces it on/off. Defaults are
+# provisional pending on-device seam/memory tuning.
+_VAE_TILE_SIZE = _env_int("MODULAR_VAE_TILE_SIZE", 256)
+_VAE_TILE_OVERLAP = _env_int("MODULAR_VAE_TILE_OVERLAP", 32)
+# 320 latent = 2560 image px; below this (<=2K) tiling stays off.
+_VAE_TILE_THRESHOLD = _env_int("MODULAR_VAE_TILE_THRESHOLD", 320)
+# None => auto (threshold-gated); "1"/"0" => force on/off.
+_VAE_TILE_FORCE = os.environ.get("MODULAR_VAE_ENABLE_TILING")
 
 
 _DEVICE_TENSOR_FIELDS = frozenset(
@@ -983,6 +1006,32 @@ class ZImagePipeline(DiffusionPipeline):
         )
 
     @traced(message="ZImagePipeline.decode_latents")
+    def _vae_decode_maybe_tiled(self, latents: Tensor) -> Tensor:
+        """VAE-decode a spatial NCHW latent, tiling for high resolutions.
+
+        Below the size threshold this is a plain ``self.vae.decode`` (the
+        non-tiled path stays byte-identical); above it (or when forced), decode
+        in overlapping spatial tiles and feather-blend so 4K+ fits without OOM
+        (see ``..autoencoders_modulev3.tiling.tiled_decode``). Gated on latent
+        edge size so resolutions that already fit are unaffected.
+        """
+        h, w = int(latents.shape[2]), int(latents.shape[3])
+        if _VAE_TILE_FORCE is not None:
+            enabled = _VAE_TILE_FORCE.strip().lower() in (
+                "1", "true", "yes", "on",
+            )
+        else:
+            enabled = max(h, w) > _VAE_TILE_THRESHOLD
+        if not enabled:
+            return self.vae.decode(latents)
+        return tiled_decode(
+            self.vae.decode,
+            latents,
+            tile_latent=_VAE_TILE_SIZE,
+            overlap_latent=_VAE_TILE_OVERLAP,
+            upsample=int(self.vae_scale_factor),
+        )
+
     def decode_latents(
         self,
         latents: Tensor,
@@ -1025,10 +1074,10 @@ class ZImagePipeline(DiffusionPipeline):
                 # scheduler group of 7).
                 end = min(start + _VAE_DECODE_MAX_BATCH, vae_batch)
                 chunk = latents[start:end]
-                parts.append(self.vae.decode(chunk))
+                parts.append(self._vae_decode_maybe_tiled(chunk))
             decoded: Tensor = F.concat(parts, axis=0)
         else:
-            decoded = self.vae.decode(latents)
+            decoded = self._vae_decode_maybe_tiled(latents)
         image = self._to_numpy(decoded)
 
         # The responses image encoder requires uint8 [0, 255] in HWC per
