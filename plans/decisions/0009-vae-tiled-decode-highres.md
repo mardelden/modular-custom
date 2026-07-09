@@ -1,6 +1,19 @@
 # Decision: Shared spatial tiled VAE decode to enable 4K image generation
 
-**Status:** Accepted · **Date:** 2026-07-09 · **Area:** VAE / high-res
+**Status:** Accepted (blend revised — see 2026-07-08 update) · **Date:** 2026-07-09 · **Area:** VAE / high-res
+
+> **Update 2026-07-08 — blend moved to the host.** The device-side feather-blend
+> described below (`F.pad` each weighted tile + accumulate + divide on device,
+> baked `F.constant` windows) was **broken**: the compiled decoder reuses its
+> output buffer across calls, so the lazy accumulation read the *last* tile for
+> every tile (black/seamed output, mean diff ~77). The blend now runs on the
+> **host** — each decoded tile is snapshotted with
+> `np.from_dlpack(img_tile.cast(f32).to(CPU()))`, accumulated in numpy, and the
+> result uploaded once via `F.constant`. Same tiling geometry, same gating, same
+> accumulate-and-divide feather; only the accumulation substrate changed. Root
+> cause + full debug trail in **lesson 0010**. Validated (below) with the host
+> blend: 1024²/2048² forced-tile ≈ untiled (mean ~1.1, seamless), 4096² seamless
+> at both tile=64 and default tile=256; ≤2K default gate byte-identical (mean 0).
 
 ## Context
 
