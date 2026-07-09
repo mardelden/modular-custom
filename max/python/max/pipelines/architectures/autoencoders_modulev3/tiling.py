@@ -37,6 +37,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import numpy as np
+from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
 
@@ -99,7 +100,9 @@ def _window(
     wy = _ramp_1d(oh, ramp_y, taper_top, taper_bot)
     wx = _ramp_1d(ow, ramp_x, taper_left, taper_right)
     w2d = np.ascontiguousarray(np.outer(wy, wx).reshape(1, 1, oh, ow))
-    tensor = F.constant(w2d, dtype=dtype, device=device)
+    # F.constant requires value.dtype == requested dtype, and numpy has no
+    # bf16 -> bake as float32, then cast to the decode output dtype.
+    tensor = F.constant(w2d, dtype=DType.float32, device=device).cast(dtype)
     _WINDOW_CACHE[key] = tensor
     return tensor
 
@@ -181,5 +184,6 @@ def tiled_decode(
             wt_sum = w_pad if wt_sum is None else wt_sum + w_pad
 
     assert out_sum is not None and wt_sum is not None
-    eps = F.constant(1e-6, dtype=out_sum.dtype, device=out_sum.device)
-    return out_sum / (wt_sum + eps)
+    # Every output pixel is covered by >= 1 tile with positive weight (border
+    # tiles keep full weight), so wt_sum > 0 everywhere -- divide directly.
+    return out_sum / wt_sum
