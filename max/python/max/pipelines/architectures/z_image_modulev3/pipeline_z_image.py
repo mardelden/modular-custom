@@ -21,6 +21,7 @@ tracing, module docstrings, and flat weight path assignment.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import MISSING, dataclass, field, fields
 from typing import Any, Literal
 
@@ -320,6 +321,14 @@ class ZImagePipeline(DiffusionPipeline):
         kwargs["latent_image_ids"] = np.asarray(context.latent_image_ids)
 
         latents_np = np.ascontiguousarray(kwargs["latents"])
+        # DEBUG: force identical noise across all num_images rows to isolate
+        # batch-position numerics (same input rows -> identical outputs iff the
+        # batched compute is row-order-deterministic).
+        if os.environ.get("ZIMAGE_FORCE_SAME_NOISE") and latents_np.shape[0] > 1:
+            latents_np = np.ascontiguousarray(
+                np.repeat(latents_np[:1], latents_np.shape[0], axis=0)
+            )
+            kwargs["latents"] = latents_np
         latent_h = int(latents_np.shape[-2])
         latent_w = int(latents_np.shape[-1])
         packed_h = int(latent_h // 2)
