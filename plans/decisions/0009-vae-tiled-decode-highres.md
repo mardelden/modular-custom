@@ -1,6 +1,18 @@
 # Decision: Shared spatial tiled VAE decode to enable 4K image generation
 
-**Status:** Accepted (blend revised; disabled-by-default for Z-Image — see 2026-07-08 updates) · **Date:** 2026-07-09 · **Area:** VAE / high-res
+**Status:** Parked (code kept, opt-in only; blend revised; disabled-by-default for Z-Image — see 2026-07-09 + 2026-07-08 updates) · **Date:** 2026-07-09 · **Area:** VAE / high-res
+
+> **Update 2026-07-09 (c) — PARKED.** 4K-via-tiling on our models is shelved.
+> Rationale: Klein/Z-Image use an **8× VAE**, so 4K unavoidably needs tiling
+> (Z-Image = tiled decode; Klein's *fused* VAE OOMs at a single 128GB alloc and
+> can't use this helper at all → 4K there is a client-side tiled img2img upscale,
+> see [[klein-4k-tiled-img2img-upscale]]). The proper answer to *native* 4K is a
+> different architecture with an aggressive-compression VAE — **Sana** (DC-AE
+> 32× → 4K latent 128×128, no tiling), **PixArt-Σ**, or **UltraFlux** — not more
+> tiling on an 8× VAE. The code stays in place and inactive (Z-Image opt-in via
+> `MODULAR_VAE_ENABLE_TILING=1`; the helper is decoder-agnostic for future
+> reuse); we're simply not investing further in the tiling path. Reopen only if
+> a concrete need arises (e.g. wiring the helper into Ideogram4/Qwen-Image).
 
 > **Update 2026-07-08 (b) — tiling is now OFF by default for Z-Image.** The
 > auto-enable-at-threshold gating below was removed. Rationale: Z-Image is
