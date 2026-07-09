@@ -200,6 +200,11 @@ def tiled_decode(
             wt_sum = w_pad if wt_sum is None else wt_sum + w_pad
 
     assert out_sum is not None and wt_sum is not None
+    result = out_sum / wt_sum
+    if _TILE_DEBUG:
+        print(f"[tiled_decode] out_sum {_stats(out_sum)}", flush=True)
+        print(f"[tiled_decode] wt_sum  {_stats(wt_sum)}", flush=True)
+        print(f"[tiled_decode] result  {_stats(result)}", flush=True)
     # Every output pixel is covered by >= 1 tile with positive weight (border
     # tiles keep full weight), so wt_sum > 0 everywhere -- divide directly.
-    return out_sum / wt_sum
+    return result
