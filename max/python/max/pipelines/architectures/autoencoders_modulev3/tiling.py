@@ -139,6 +139,6 @@ def tiled_decode(
             out_sum[:, :, iy0 : iy0 + oh, ix0 : ix0 + ow] += img_np * win
             wt_sum[:, :, iy0 : iy0 + oh, ix0 : ix0 + ow] += win
 
-    blended = np.ascontiguousarray(out_sum / wt_sum)
-    tensor = Tensor(storage=Buffer.from_dlpack(blended).to(device))
+    blended = np.ascontiguousarray(out_sum / wt_sum, dtype=np.float32)
+    tensor = F.constant(blended, dtype=DType.float32, device=device)
     return tensor.cast(out_dtype)
