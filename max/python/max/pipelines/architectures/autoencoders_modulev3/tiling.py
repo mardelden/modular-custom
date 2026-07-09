@@ -198,6 +198,13 @@ def tiled_decode(
             w_pad = F.pad(win, pads)                # [1,1,out_h,out_w]
             out_sum = weighted if out_sum is None else out_sum + weighted
             wt_sum = w_pad if wt_sum is None else wt_sum + w_pad
+            # Realize the accumulators now: the compiled decoder reuses its
+            # output buffer across calls, so a deferred (lazy) blend would read
+            # the LAST tile's pixels for every tile. Consuming each tile into a
+            # materialized accumulator here also frees the tile before the next
+            # decode, bounding peak memory.
+            out_sum._sync_realize()
+            wt_sum._sync_realize()
 
     assert out_sum is not None and wt_sum is not None
     result = out_sum / wt_sum
