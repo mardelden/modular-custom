@@ -21,7 +21,6 @@ tracing, module docstrings, and flat weight path assignment.
 from __future__ import annotations
 
 import hashlib
-import os
 from dataclasses import MISSING, dataclass, field, fields
 from typing import Any, Literal
 
@@ -45,6 +44,22 @@ from .model import ZImageTransformerModel
 # batch >= 8; decode in chunks no larger than this (works for num_images and
 # dynamic batching alike). 4 leaves margin under the observed limit of 7.
 _VAE_DECODE_MAX_BATCH = 4
+
+# Under dynamic batching, pad every request's text to this fixed length so the
+# joint-attention sequence length -- and thus the flash-attention tile count --
+# is constant regardless of batch composition. Without this, a request batched
+# with a longer-prompt neighbor crosses a 128-token attention tile boundary,
+# changing float accumulation order and (via diffusion's step-to-step chaos) the
+# final image -- i.e. the result would depend on the batch neighbors. Prompts
+# longer than this round up to the next 128 multiple (rare for image prompts).
+_FIXED_TEXT_PAD = 256
+
+
+def _dyn_text_pad_len(max_real_len: int) -> int:
+    """Fixed padded text length for dynamic batching (constant tile count)."""
+    if max_real_len <= _FIXED_TEXT_PAD:
+        return _FIXED_TEXT_PAD
+    return ((max_real_len + 127) // 128) * 128
 
 
 _DEVICE_TENSOR_FIELDS = frozenset(
@@ -321,14 +336,6 @@ class ZImagePipeline(DiffusionPipeline):
         kwargs["latent_image_ids"] = np.asarray(context.latent_image_ids)
 
         latents_np = np.ascontiguousarray(kwargs["latents"])
-        # DEBUG: force identical noise across all num_images rows to isolate
-        # batch-position numerics (same input rows -> identical outputs iff the
-        # batched compute is row-order-deterministic).
-        if os.environ.get("ZIMAGE_FORCE_SAME_NOISE") and latents_np.shape[0] > 1:
-            latents_np = np.ascontiguousarray(
-                np.repeat(latents_np[:1], latents_np.shape[0], axis=0)
-            )
-            kwargs["latents"] = latents_np
         latent_h = int(latents_np.shape[-2])
         latent_w = int(latents_np.shape[-1])
         packed_h = int(latent_h // 2)
@@ -457,11 +464,18 @@ class ZImagePipeline(DiffusionPipeline):
             raise ValueError(
                 "prepare_inputs_batched requires at least one context"
             )
-        # DEBUG: with ZIMAGE_DEBUG_PAD_TO set, route even a single request
-        # through the padded batched path so we can measure length-dependence.
-        _debug_pad_to = int(os.environ.get("ZIMAGE_DEBUG_PAD_TO", "0"))
-        if len(contexts) == 1 and _debug_pad_to <= 0:
-            return self.prepare_inputs(contexts[0])
+        # A single non-CFG text-to-image request still goes through the padded
+        # batched path so its (fixed) attention tile count matches real batches
+        # -- its result doesn't depend on whether it happened to be batched.
+        # CFG / img2img requests (never dynamically batched) use the plain
+        # single path.
+        if len(contexts) == 1:
+            c = contexts[0]
+            is_cfg = (
+                float(c.guidance_scale) > 0.0 and c.negative_tokens is not None
+            )
+            if is_cfg or c.input_image is not None:
+                return self.prepare_inputs(c)
 
         ref = contexts[0]
         for c in contexts:
@@ -503,9 +517,7 @@ class ZImagePipeline(DiffusionPipeline):
             token_tensors.append(
                 self._token_tensor_from_numpy(toks_np, text_device)
             )
-        txt_padded = max(real_lens)
-        if _debug_pad_to > txt_padded:  # DEBUG length-dependence test
-            txt_padded = _debug_pad_to
+        txt_padded = _dyn_text_pad_len(max(real_lens))
 
         # Concatenate per-context latents -> [sum(num_images), C, H, W].
         latents_np = np.ascontiguousarray(
@@ -821,12 +833,9 @@ class ZImagePipeline(DiffusionPipeline):
             embeds.append(e)
             real_lens.append(int(e.shape[1]))
 
-        txt_padded = max(real_lens)
-        # DEBUG: force a larger padded length to test length-dependence of the
-        # attention (pad content is masked; only the sequence length changes).
-        _pad_to = int(os.environ.get("ZIMAGE_DEBUG_PAD_TO", "0"))
-        if _pad_to > txt_padded:
-            txt_padded = _pad_to
+        # Fixed padded length -> constant attention tile count -> the result is
+        # independent of batch neighbors (see _FIXED_TEXT_PAD).
+        txt_padded = _dyn_text_pad_len(max(real_lens))
         hidden = int(embeds[0].shape[2])
         rows: list[Tensor] = []
         per_row_real: list[int] = []
@@ -1426,11 +1435,6 @@ class ZImagePipeline(DiffusionPipeline):
                 real = list(per_row_real_txt)
             else:
                 real = [txt_padded] * batch_size
-            # DEBUG: mask the last K *real* text tokens to test whether the
-            # additive mask is actually applied by masked_flash_attention_gpu.
-            _mask_last = int(os.environ.get("ZIMAGE_DEBUG_MASK_LAST", "0"))
-            if _mask_last > 0:
-                real = [max(1, r - _mask_last) for r in real]
             neg = np.float32(-1e9)
             txt_mask_np = np.zeros((batch_size, txt_padded), dtype=np.float32)
             uni_len = image_seq_len + txt_padded
