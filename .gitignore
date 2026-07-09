@@ -163,3 +163,6 @@ examples/models/*
 
 # Kgen trace
 kgen.trace.*
+
+# Local render/example outputs (large image binaries, not for commit)
+/local-render-examples/
