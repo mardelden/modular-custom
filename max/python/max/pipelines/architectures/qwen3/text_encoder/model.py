@@ -19,6 +19,7 @@ This module provides a ComponentModel wrapper for Qwen3 text encoder.
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
@@ -27,11 +28,14 @@ from max.driver import Buffer, Device
 from max.engine import InferenceSession, Model
 from max.graph import Graph
 from max.graph.weights import Weights
+from max.nn.quant_config import QuantConfig
 from max.pipelines.lib import SupportedEncoding
 from max.pipelines.modeling.base.component_model import ComponentModel
+from max.pipelines.modeling.config_enums import supported_encoding_dtype
 from max.pipelines.modeling.dataprocessing.causal_attention_mask import (
     causal_attention_mask_with_token_mask,
 )
+from max.pipelines.weights.quant import parse_quant_config
 
 from .model_config import Qwen3TextEncoderConfig
 from .qwen3 import Qwen3TextEncoderTransformer
@@ -65,6 +69,11 @@ class Qwen3TextEncoderModel(ComponentModel):
         """
         super().__init__(config, encoding, devices, weights, **kwargs)
         self.session = session
+        # Kept for quantization: the raw HF config (holds ``quantization_config``
+        # when pointed at an fp4/fp8 Qwen3 checkpoint) and the requested encoding
+        # (its weight dtype selects the fp4/fp8 parser).
+        self._raw_config = config
+        self._encoding = encoding
         self.config = Qwen3TextEncoderConfig.initialize_from_config(
             config,
             encoding,
@@ -72,6 +81,27 @@ class Qwen3TextEncoderModel(ComponentModel):
         )
         self.config.hidden_state_layers = self._resolve_hidden_state_layers()
         self.load_model()
+
+    def _parse_quant_config(
+        self, state_dict: dict[str, Any]
+    ) -> QuantConfig | None:
+        """Parse a QuantConfig for a quantized (fp4/fp8) encoder checkpoint.
+
+        Returns ``None`` for bf16 (the default), leaving the encoder unchanged.
+        Requires the checkpoint's HF config to carry ``quantization_config``
+        (i.e. point ``text_encoder.model_path`` at an fp4/fp8 Qwen3 repo).
+        """
+        weight_dtype = supported_encoding_dtype(self._encoding)
+        text_config = self._raw_config.get("text_config", self._raw_config)
+        hf_config = SimpleNamespace(**text_config)
+        # state_dict keys are already normalized (``model.`` stripped by the
+        # safetensor map), so no ignored-module prefix.
+        return parse_quant_config(
+            hf_config,
+            state_dict,
+            weight_dtype,
+            ignored_modules_prefix="",
+        )
 
     def _resolve_hidden_state_layers(self) -> list[int]:
         raw_layers = list(self.config.hidden_state_layers)
@@ -140,7 +170,10 @@ class Qwen3TextEncoderModel(ComponentModel):
             Compiled model callable.
         """
         state_dict = self._state_dict()
-        nn_model = Qwen3TextEncoderTransformer(self.config)
+        quant_config = self._parse_quant_config(state_dict)
+        nn_model = Qwen3TextEncoderTransformer(
+            self.config, quant_config=quant_config
+        )
         nn_model.load_state_dict(state_dict, weight_alignment=1, strict=True)
         self.state_dict = nn_model.state_dict()
 

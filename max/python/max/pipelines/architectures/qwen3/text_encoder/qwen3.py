@@ -27,6 +27,7 @@ from max.nn.embedding import Embedding
 from max.nn.layer import LayerList, Module
 from max.nn.linear import Linear
 from max.nn.norm import RMSNorm
+from max.nn.quant_config import QuantConfig
 from max.nn.rotary_embedding import RotaryEmbedding
 
 from .layers import EncoderAttention
@@ -44,6 +45,7 @@ class Qwen3MLP(Module):
         intermediate_size: int,
         dtype: DType,
         device: DeviceRef,
+        quant_config: QuantConfig | None = None,
     ) -> None:
         super().__init__()
         self.gate_proj = Linear(
@@ -52,6 +54,7 @@ class Qwen3MLP(Module):
             dtype,
             device,
             has_bias=False,
+            quant_config=quant_config,
         )
         self.up_proj = Linear(
             hidden_size,
@@ -59,6 +62,7 @@ class Qwen3MLP(Module):
             dtype,
             device,
             has_bias=False,
+            quant_config=quant_config,
         )
         self.down_proj = Linear(
             intermediate_size,
@@ -66,6 +70,7 @@ class Qwen3MLP(Module):
             dtype,
             device,
             has_bias=False,
+            quant_config=quant_config,
         )
 
     def __call__(self, hidden_states: TensorValue) -> TensorValue:
@@ -88,6 +93,7 @@ class EncoderTransformerBlock(Module):
         scale: float,
         dtype: DType,
         device: DeviceRef,
+        quant_config: QuantConfig | None = None,
     ) -> None:
         super().__init__()
         self.self_attn = EncoderAttention(
@@ -99,12 +105,14 @@ class EncoderTransformerBlock(Module):
             dtype=dtype,
             device=device,
             rms_norm_eps=rms_norm_eps,
+            quant_config=quant_config,
         )
         self.mlp = Qwen3MLP(
             hidden_size,
             intermediate_size,
             dtype,
             device,
+            quant_config=quant_config,
         )
         self.input_layernorm = RMSNorm(
             hidden_size,
@@ -158,7 +166,11 @@ class Qwen3TextEncoderTransformer(Module):
     merging the layer/hidden dimensions.
     """
 
-    def __init__(self, config: Qwen3TextEncoderConfig) -> None:
+    def __init__(
+        self,
+        config: Qwen3TextEncoderConfig,
+        quant_config: QuantConfig | None = None,
+    ) -> None:
         super().__init__()
 
         self.dim = config.hidden_size
@@ -196,6 +208,7 @@ class Qwen3TextEncoderTransformer(Module):
                     scale=config.attention_multiplier,
                     dtype=config.dtype,
                     device=config.device,
+                    quant_config=quant_config,
                 )
                 for _ in range(config.num_hidden_layers)
             ]

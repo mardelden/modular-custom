@@ -23,6 +23,7 @@ from max.nn.kernels import masked_flash_attention_gpu
 from max.nn.layer import Module
 from max.nn.linear import Linear
 from max.nn.norm import RMSNorm
+from max.nn.quant_config import QuantConfig
 from max.nn.rotary_embedding import RotaryEmbedding
 
 
@@ -39,6 +40,7 @@ class EncoderAttention(Module):
         dtype: DType,
         device: DeviceRef,
         rms_norm_eps: float = 1e-6,
+        quant_config: QuantConfig | None = None,
     ) -> None:
         super().__init__()
         self.n_heads = num_attention_heads
@@ -50,10 +52,24 @@ class EncoderAttention(Module):
         q_dim = head_dim * num_attention_heads
         kv_dim = head_dim * num_key_value_heads
 
-        self.q_proj = Linear(hidden_size, q_dim, dtype, device, has_bias=False)
-        self.k_proj = Linear(hidden_size, kv_dim, dtype, device, has_bias=False)
-        self.v_proj = Linear(hidden_size, kv_dim, dtype, device, has_bias=False)
-        self.o_proj = Linear(q_dim, hidden_size, dtype, device, has_bias=False)
+        # `dtype` is the compute dtype (bf16); `quant_config` (when set) makes
+        # the projection *weights* fp4/fp8. q_norm/k_norm stay bf16.
+        self.q_proj = Linear(
+            hidden_size, q_dim, dtype, device, has_bias=False,
+            quant_config=quant_config,
+        )
+        self.k_proj = Linear(
+            hidden_size, kv_dim, dtype, device, has_bias=False,
+            quant_config=quant_config,
+        )
+        self.v_proj = Linear(
+            hidden_size, kv_dim, dtype, device, has_bias=False,
+            quant_config=quant_config,
+        )
+        self.o_proj = Linear(
+            q_dim, hidden_size, dtype, device, has_bias=False,
+            quant_config=quant_config,
+        )
 
         self.q_norm = RMSNorm(
             head_dim,

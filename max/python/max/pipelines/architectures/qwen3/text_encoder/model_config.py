@@ -85,9 +85,17 @@ class Qwen3TextEncoderConfig(MAXModelConfigBase):
             num_attention_heads = init_dict.get("num_attention_heads", 32)
             init_dict["head_dim"] = hidden_size // num_attention_heads
 
+        # Compute dtype. NVFP4 weights compute in bf16 (embeddings, norms and
+        # activations stay bf16); the QuantConfig parsed in the model makes only
+        # the projection *weights* fp4. Mirrors Flux2's transformer handling.
+        compute_dtype = (
+            DType.bfloat16
+            if encoding == "float4_e2m1fnx2"
+            else supported_encoding_dtype(encoding)
+        )
         init_dict.update(
             {
-                "dtype": supported_encoding_dtype(encoding),
+                "dtype": compute_dtype,
                 "device": DeviceRef.from_device(devices[0]),
             }
         )

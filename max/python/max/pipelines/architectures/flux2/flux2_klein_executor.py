@@ -285,11 +285,19 @@ class Flux2KleinExecutor(
         text_encoder_entry = manifest["text_encoder"]
         text_encoder_devices = load_devices(text_encoder_entry.device_specs)
         self._text_encoder_device: Device = text_encoder_devices[0]
+        # The text encoder honors its OWN resolved encoding first (e.g. an
+        # explicit ``--model-override text_encoder.quantization_encoding=…``
+        # pointing at an fp4/fp8 Qwen3 checkpoint). Only fall back to the
+        # bf16 ``_component_encoding`` guard when the encoder didn't resolve a
+        # concrete encoding, so an NVFP4 transformer no longer forces bf16 here.
+        text_encoder_encoding = (
+            text_encoder_entry.quantization_encoding
+            or self._component_encoding
+            or "bfloat16"
+        )
         self.text_encoder = Qwen3TextEncoderKleinModel(
             config=text_encoder_entry.huggingface_config.to_dict(),
-            encoding=self._component_encoding
-            or text_encoder_entry.quantization_encoding
-            or "bfloat16",
+            encoding=text_encoder_encoding,
             devices=text_encoder_devices,
             weights=load_weights(text_encoder_entry.resolved_weight_paths()),
             session=session,
