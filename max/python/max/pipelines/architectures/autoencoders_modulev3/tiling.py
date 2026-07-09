@@ -20,21 +20,21 @@ full-resolution conv/GroupNorm intermediates -- e.g. a 4096^2 image unpacks to a
 ``[1,16,512,512]`` latent whose first conv intermediate alone needs ~47 GB.
 
 The helper is decoder-agnostic: it only needs a ``decode_fn`` (latent tile ->
-image tile) and the decoder's spatial ``upsample`` factor, so it can be reused
-across pipelines that share (or differ in) their VAE decoder. It relies on the
-fact that each ``decode_fn`` call is a separate compiled graph, so tiles are
-materialized and their intermediates freed one at a time -- that is what bounds
-peak memory.
+image tile) and the decoder's spatial ``upsample`` factor. Each ``decode_fn``
+call is a separate compiled graph, so tiles are decoded one at a time and their
+conv intermediates freed before the next -- that bounds peak GPU memory.
 
-2D convs bleed at tile borders, so tiles overlap and are blended with a
-separable raised-cosine (Hann) feather. Blending uses accumulate-and-divide
-(``sum(weight*tile) / sum(weight)``), which is correct for arbitrary/irregular
-overlap and keeps full weight at the true image border (no darkened frame).
+Blending is done on the HOST: the compiled decoder reuses its output buffer
+across calls, so each decoded tile is copied to a numpy array immediately (this
+captures its content before the next decode overwrites the buffer), accumulated
+with a separable raised-cosine (Hann) feather, and the final image is uploaded
+once. Accumulate-and-divide (``sum(w*tile)/sum(w)``) is correct for arbitrary
+overlap and keeps full weight at the true image border (no darkened frame). The
+host arrays are cheap (a 4K image is ~800 MB f32) and the decode stays on GPU.
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 
 import numpy as np
@@ -42,16 +42,6 @@ from max.driver import CPU
 from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
-
-_TILE_DEBUG = bool(os.environ.get("ZIMAGE_TILE_DEBUG"))
-
-
-def _stats(t: Tensor) -> str:
-    a = np.from_dlpack(t.cast(DType.float32).to(CPU()))
-    return f"shape={tuple(a.shape)} min={a.min():.3f} max={a.max():.3f} mean={a.mean():.3f}"
-
-# Baked separable feather windows, keyed by geometry + taper flags + dtype.
-_WINDOW_CACHE: dict[tuple, Tensor] = {}
 
 
 def _tile_starts(extent: int, tile: int, overlap: int) -> list[int]:
@@ -85,37 +75,6 @@ def _ramp_1d(
     return w
 
 
-def _window(
-    oh: int,
-    ow: int,
-    ramp_y: int,
-    ramp_x: int,
-    taper_top: bool,
-    taper_bot: bool,
-    taper_left: bool,
-    taper_right: bool,
-    dtype,
-    device,
-) -> Tensor:
-    """Separable feather window ``[1, 1, oh, ow]`` (cached)."""
-    key = (
-        oh, ow, ramp_y, ramp_x,
-        taper_top, taper_bot, taper_left, taper_right,
-        dtype, str(device),
-    )
-    cached = _WINDOW_CACHE.get(key)
-    if cached is not None:
-        return cached
-    wy = _ramp_1d(oh, ramp_y, taper_top, taper_bot)
-    wx = _ramp_1d(ow, ramp_x, taper_left, taper_right)
-    w2d = np.ascontiguousarray(np.outer(wy, wx).reshape(1, 1, oh, ow))
-    # F.constant requires value.dtype == requested dtype, and numpy has no
-    # bf16 -> bake as float32, then cast to the decode output dtype.
-    tensor = F.constant(w2d, dtype=DType.float32, device=device).cast(dtype)
-    _WINDOW_CACHE[key] = tensor
-    return tensor
-
-
 def tiled_decode(
     decode_fn: Callable[[Tensor], Tensor],
     latent: Tensor,
@@ -128,16 +87,14 @@ def tiled_decode(
 
     Args:
         decode_fn: Maps a latent tile ``[B, C, h, w]`` to an image
-            ``[B, 3, upsample*h, upsample*w]`` (e.g. ``vae.decode``). Each call
-            is a separate compiled graph, so tiles decode and free their conv
-            intermediates one at a time -- this bounds peak memory.
+            ``[B, 3, upsample*h, upsample*w]`` (e.g. ``vae.decode``).
         latent: Spatial NCHW latent ``[B, C, H, W]`` (post-denorm).
         tile_latent: Tile edge in latent pixels.
         overlap_latent: Minimum overlap band in latent pixels (< ``tile_latent``).
         upsample: Decoder spatial upsample factor (e.g. 8).
 
     Returns:
-        Decoded image ``[B, 3, upsample*H, upsample*W]``.
+        Decoded image ``[B, 3, upsample*H, upsample*W]`` (device tensor).
     """
     height = int(latent.shape[2])
     width = int(latent.shape[3])
@@ -162,53 +119,26 @@ def tiled_decode(
     ramp_y = u * max(0, th - step_y)
     ramp_x = u * max(0, tw - step_x)
 
-    if _TILE_DEBUG:
-        print(f"[tiled_decode] H={height} W={width} tile={tile} ov={overlap} "
-              f"ys={ys} xs={xs} ramp_y={ramp_y} ramp_x={ramp_x}", flush=True)
+    batch = int(latent.shape[0])
+    device = latent.device
+    out_sum = np.zeros((batch, 3, out_h, out_w), dtype=np.float32)
+    wt_sum = np.zeros((1, 1, out_h, out_w), dtype=np.float32)
+    out_dtype = latent.dtype
 
-    out_sum: Tensor | None = None
-    wt_sum: Tensor | None = None
     for y0 in ys:
         for x0 in xs:
             img_tile = decode_fn(latent[:, :, y0 : y0 + th, x0 : x0 + tw])
-            # The compiled decoder reuses its output buffer across calls, so
-            # realize each tile now to pin its buffer -- otherwise the deferred
-            # (lazy) blend reads the LAST tile's pixels for every tile.
-            img_tile._sync_realize()
-            if _TILE_DEBUG:
-                print(f"[tiled_decode] tile y0={y0} x0={x0} -> {_stats(img_tile)}",
-                      flush=True)
-            win = _window(
-                oh,
-                ow,
-                ramp_y,
-                ramp_x,
-                taper_top=y0 != 0,
-                taper_bot=(y0 + th) != height,
-                taper_left=x0 != 0,
-                taper_right=(x0 + tw) != width,
-                dtype=img_tile.dtype,
-                device=img_tile.device,
-            )
+            out_dtype = img_tile.dtype
+            # Copy to host immediately -- the decoder reuses its output buffer
+            # on the next call, so this captures the tile before it's clobbered.
+            img_np = np.from_dlpack(img_tile.cast(DType.float32).to(CPU()))
+            wy = _ramp_1d(oh, ramp_y, y0 != 0, (y0 + th) != height)
+            wx = _ramp_1d(ow, ramp_x, x0 != 0, (x0 + tw) != width)
+            win = np.outer(wy, wx).reshape(1, 1, oh, ow)
             iy0, ix0 = u * y0, u * x0
-            # F.pad order: [N_before,N_after, C.., H.., W..].
-            pads = [
-                0, 0,
-                0, 0,
-                iy0, out_h - iy0 - oh,
-                ix0, out_w - ix0 - ow,
-            ]
-            weighted = F.pad(img_tile * win, pads)  # [B,3,out_h,out_w]
-            w_pad = F.pad(win, pads)                # [1,1,out_h,out_w]
-            out_sum = weighted if out_sum is None else out_sum + weighted
-            wt_sum = w_pad if wt_sum is None else wt_sum + w_pad
+            out_sum[:, :, iy0 : iy0 + oh, ix0 : ix0 + ow] += img_np * win
+            wt_sum[:, :, iy0 : iy0 + oh, ix0 : ix0 + ow] += win
 
-    assert out_sum is not None and wt_sum is not None
-    result = out_sum / wt_sum
-    if _TILE_DEBUG:
-        print(f"[tiled_decode] out_sum {_stats(out_sum)}", flush=True)
-        print(f"[tiled_decode] wt_sum  {_stats(wt_sum)}", flush=True)
-        print(f"[tiled_decode] result  {_stats(result)}", flush=True)
-    # Every output pixel is covered by >= 1 tile with positive weight (border
-    # tiles keep full weight), so wt_sum > 0 everywhere -- divide directly.
-    return result
+    blended = np.ascontiguousarray(out_sum / wt_sum)
+    tensor = Tensor(storage=Buffer.from_dlpack(blended).to(device))
+    return tensor.cast(out_dtype)
