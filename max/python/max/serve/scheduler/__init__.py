@@ -95,12 +95,21 @@ def load_scheduler(
         def batch_key(context: PixelContext) -> Hashable:
             """Group requests that a single batched denoise loop can serve.
 
-            Requests batch only when resolution, steps, num_images, CFG
-            shape (negative prompt present + guidance>1) all match. Image-to-
-            image requests are always solo (unique key) since the batched
-            path is text-to-image only.
+            Requests batch only when resolution, steps and num_images match.
+            Image-to-image and CFG (classifier-free guidance) requests are
+            always solo (unique key): the batched denoise path is text-to-image,
+            non-CFG only, so grouping a CFG request would hit the
+            ``prepare_inputs_batched`` guard and 500. Solo requests fall through
+            to the single-request path, which supports CFG.
             """
             if getattr(context, "input_image", None) is not None:
+                return ("solo", context.request_id)
+            # CFG here mirrors the pipeline's batched guard: guidance>0 with a
+            # negative stream present. Run each such request on its own.
+            if (
+                context.guidance_scale > 0.0
+                and getattr(context, "negative_tokens", None) is not None
+            ):
                 return ("solo", context.request_id)
             return (
                 context.height,
