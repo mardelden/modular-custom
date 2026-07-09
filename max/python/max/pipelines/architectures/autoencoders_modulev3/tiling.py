@@ -34,12 +34,21 @@ overlap and keeps full weight at the true image border (no darkened frame).
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 
 import numpy as np
+from max.driver import CPU
 from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.tensor import Tensor
+
+_TILE_DEBUG = bool(os.environ.get("ZIMAGE_TILE_DEBUG"))
+
+
+def _stats(t: Tensor) -> str:
+    a = np.from_dlpack(t.cast(DType.float32).to(CPU()))
+    return f"shape={tuple(a.shape)} min={a.min():.3f} max={a.max():.3f} mean={a.mean():.3f}"
 
 # Baked separable feather windows, keyed by geometry + taper flags + dtype.
 _WINDOW_CACHE: dict[tuple, Tensor] = {}
@@ -153,11 +162,18 @@ def tiled_decode(
     ramp_y = u * max(0, th - step_y)
     ramp_x = u * max(0, tw - step_x)
 
+    if _TILE_DEBUG:
+        print(f"[tiled_decode] H={height} W={width} tile={tile} ov={overlap} "
+              f"ys={ys} xs={xs} ramp_y={ramp_y} ramp_x={ramp_x}", flush=True)
+
     out_sum: Tensor | None = None
     wt_sum: Tensor | None = None
     for y0 in ys:
         for x0 in xs:
             img_tile = decode_fn(latent[:, :, y0 : y0 + th, x0 : x0 + tw])
+            if _TILE_DEBUG:
+                print(f"[tiled_decode] tile y0={y0} x0={x0} -> {_stats(img_tile)}",
+                      flush=True)
             win = _window(
                 oh,
                 ow,
