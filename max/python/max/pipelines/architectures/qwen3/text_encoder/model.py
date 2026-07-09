@@ -160,6 +160,11 @@ class Qwen3TextEncoderModel(ComponentModel):
             # Skip checkpoint keys the encoder-only module doesn't use.
             if adapted_key in ("norm.weight", "lm_head.weight"):
                 continue
+            # Modelopt fp4/fp8 checkpoints ship KV-cache quantization scales
+            # (``kv_cache_scheme``) as ``*.k_proj.k_scale`` / ``*.v_proj.v_scale``.
+            # The encoder-only module has no KV cache, so drop them.
+            if adapted_key.endswith((".k_scale", ".v_scale")):
+                continue
             state_dict[adapted_key] = value.data()
         return state_dict
 
