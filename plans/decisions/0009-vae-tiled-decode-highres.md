@@ -1,8 +1,20 @@
 # Decision: Shared spatial tiled VAE decode to enable 4K image generation
 
-**Status:** Accepted (blend revised — see 2026-07-08 update) · **Date:** 2026-07-09 · **Area:** VAE / high-res
+**Status:** Accepted (blend revised; disabled-by-default for Z-Image — see 2026-07-08 updates) · **Date:** 2026-07-09 · **Area:** VAE / high-res
 
-> **Update 2026-07-08 — blend moved to the host.** The device-side feather-blend
+> **Update 2026-07-08 (b) — tiling is now OFF by default for Z-Image.** The
+> auto-enable-at-threshold gating below was removed. Rationale: Z-Image is
+> ~2K-native (Tongyi's whole family caps recommended output at 2048²), and true
+> 4K needs a tiled *img2img upscale* (native-resolution tiles refined by the
+> model), not merely a tiled *decode* of a 4K latent — so auto-tiling the decode
+> is not a useful default (a 4K txt2img latent just yields a small subject on a
+> big canvas). The helper + wiring are kept; tiling is opt-in via
+> `MODULAR_VAE_ENABLE_TILING=1`. `MODULAR_VAE_TILE_THRESHOLD` was dropped.
+> Default Z-Image decode is now plain `self.vae.decode` (byte-identical) at all
+> sizes; a 4K request OOMs unless tiling is force-enabled. Verified: 1024²/2048²
+> default = mean 0.0000 vs untiled.
+
+> **Update 2026-07-08 (a) — blend moved to the host.** The device-side feather-blend
 > described below (`F.pad` each weighted tile + accumulate + divide on device,
 > baked `F.constant` windows) was **broken**: the compiled decoder reuses its
 > output buffer across calls, so the lazy accumulation read the *last* tile for
