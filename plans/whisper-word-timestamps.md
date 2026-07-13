@@ -21,20 +21,26 @@ All code is written. Validated locally on **Mac CPU** (backend-agnostic correctn
 
 **Pending on-hardware (deploy loop):** gate (c) transcript vs HF greedy on real audio, gate (d) word-timestamp A/B vs faster-whisper / HF, gate (e) GPU sm_120 + large-v3 numerics/RTF. Instruments are ready — see "Deploy-team handoff" below.
 
-## Deploy-team handoff
+## Deploy vs validation (split responsibilities)
 
-Everything runs from `max/tests/integration/architectures/whisper/standalone/` via `run_gates.sh`. On max-build (matches the branch base, no ABI drift), use a worktree + the baked venv:
+**Deploy team — DEPLOY ONLY (do not run the gates).** Make `feat/whisper-word-ts` runnable on max-build and hand back the two paths below; we drive validation:
 
+1. Worktree on the box (do **NOT** switch `/opt/modular-custom`'s own branch — the Klein fp4 dev serve runs from it):
+   ```bash
+   git -C /opt/modular-custom worktree add /opt/modular-whisper feat/whisper-word-ts
+   ```
+2. A Python that imports the custom `max` — the baked venv `/root/wheeltest-baked/bin/python` or the published wheelhouse wheel (branch base ⇒ no ABI drift) — plus the parity deps: `torch`, `transformers>=5.12,<5.13`, `datasets`, `soundfile`, `numpy`. (`faster-whisper` only for the optional acceptance ref — a throwaway venv is fine.)
+3. Confirm HF access (large-v3 downloadable/cached) and drop a ≤30s test clip on the box.
+
+**Deliverable back to us:** the worktree path (`/opt/modular-whisper`), the python path, and a confirmed `import max`.
+
+**Us — VALIDATION + iteration.** Once deployed, we run the gates and own correctness:
 ```bash
-# one-time: worktree on the box (do NOT switch /opt/modular-custom's branch)
-git -C /opt/modular-custom worktree add /opt/modular-whisper feat/whisper-word-ts
-# run the gates (large-v3, GPU) with a <=30s clip
-PY=/root/wheeltest-baked/bin/python MODEL=openai/whisper-large-v3 DEVICE=gpu \
-  AUDIO=/root/jfk.wav PYTHONPATH=/opt/modular-whisper/max/python \
+PY=<their python> MODEL=openai/whisper-large-v3 DEVICE=gpu AUDIO=<clip.wav> \
+  PYTHONPATH=/opt/modular-whisper/max/python \
   /opt/modular-whisper/max/tests/integration/architectures/whisper/standalone/run_gates.sh
 ```
-
-`PYTHONPATH=<worktree>/max/python` overlays the whisper package onto the installed `max`. Report back: the gate (a)–(d) PASS/FAIL lines + the `|Δ|` word-timing stats. If a gate fails, that's the iterate signal (I instrument + request a redeploy). Local Mac dev overlays the 4–8 changed files onto a nightly-wheel venv instead (nightly index `https://whl.modular.com/nightly/simple/`).
+`PYTHONPATH=<worktree>/max/python` overlays the whisper package onto the installed `max`. We read the gate (a)–(e) PASS/FAIL + the `|Δ|` word-timing stats; on a failure we fix on the branch and ask the deploy team to **redeploy** (that's their only follow-up). Local Mac dev overlays the changed files onto a nightly-wheel venv (`https://whl.modular.com/nightly/simple/`).
 
 ## Context
 
