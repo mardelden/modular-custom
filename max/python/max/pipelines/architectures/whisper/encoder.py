@@ -31,7 +31,9 @@ class WhisperSdpaAttention(Module):
     ) -> None:
         super().__init__()
         d_model = huggingface_config.d_model
-        self.n_heads = huggingface_config.n_heads
+        # WhisperConfig exposes `encoder_attention_heads`; there is no
+        # `n_heads` attribute (this was the original bring-up bug, B1).
+        self.n_heads = huggingface_config.encoder_attention_heads
         self.head_dim = d_model // huggingface_config.encoder_attention_heads
 
         self.wq = Linear(d_model, d_model, dtype, device, has_bias=True)
@@ -80,24 +82,18 @@ class WhisperSdpaAttention(Module):
 
 
 class MLP(Module):
+    """Whisper feed-forward block (``fc1`` -> gelu -> ``fc2``).
+
+    Parameterized by explicit dims so both the encoder (``encoder_ffn_dim``)
+    and the decoder (``decoder_ffn_dim``) can reuse it.
+    """
+
     def __init__(
-        self, huggingface_config: AutoConfig, dtype: DType, device: DeviceRef
+        self, d_model: int, ffn_dim: int, dtype: DType, device: DeviceRef
     ) -> None:
         super().__init__()
-        self.fc1 = Linear(
-            huggingface_config.d_model,
-            huggingface_config.encoder_ffn_dim,
-            dtype,
-            device,
-            has_bias=True,
-        )
-        self.fc2 = Linear(
-            huggingface_config.encoder_ffn_dim,
-            huggingface_config.d_model,
-            dtype,
-            device,
-            has_bias=True,
-        )
+        self.fc1 = Linear(d_model, ffn_dim, dtype, device, has_bias=True)
+        self.fc2 = Linear(ffn_dim, d_model, dtype, device, has_bias=True)
 
     def __call__(self, x: TensorValue) -> TensorValue:
         x = self.fc1(x)
@@ -114,7 +110,12 @@ class WhisperEncoderLayer(Module):
     ) -> None:
         super().__init__()
         self.attention = WhisperSdpaAttention(huggingface_config, dtype, device)
-        self.mlp = MLP(huggingface_config, dtype, device)
+        self.mlp = MLP(
+            huggingface_config.d_model,
+            huggingface_config.encoder_ffn_dim,
+            dtype,
+            device,
+        )
         self.attention_norm = LayerNorm(
             huggingface_config.d_model, devices=[device], dtype=dtype, eps=1e-5
         )
@@ -151,6 +152,10 @@ class WhisperEncoder(Module):
         self, huggingface_config: AutoConfig, dtype: DType, device: DeviceRef
     ) -> None:
         super().__init__()
+        # permute=True keeps the checkpoint's PyTorch conv layout: weights are
+        # (out_channels, in_channels, kernel) and input/output stay channel-
+        # first [batch, channels, length]. This lets the HF conv weights load
+        # verbatim (no transpose in the adapter) — part of the B4 fix.
         self.conv1 = Conv1D(
             kernel_size=3,
             in_channels=huggingface_config.num_mel_bins,
@@ -160,6 +165,7 @@ class WhisperEncoder(Module):
             padding=1,
             device=device,
             has_bias=True,
+            permute=True,
         )
         self.conv2 = Conv1D(
             kernel_size=3,
@@ -170,6 +176,7 @@ class WhisperEncoder(Module):
             padding=1,
             device=device,
             has_bias=True,
+            permute=True,
         )
         # TODO: Not sure how to handle this. It learns embeddings to a max size.
         self.embed_positions = Embedding(
@@ -196,14 +203,18 @@ class WhisperEncoder(Module):
             input_features: Buffer of shape (batch_size, feature_size, sequence_length)
         """
         # Encoder stem: two convolution layers and the GELU activation function.
+        # input_features is [batch, num_mel_bins, 3000]; conv1 (stride 1) keeps
+        # the length, conv2 (stride 2) halves it -> [batch, d_model, 1500].
         inputs_embeds = ops.gelu(self.conv1(input_features))
         inputs_embeds = ops.gelu(self.conv2(inputs_embeds))
 
-        # self.embed_positions.weights layers is of shape = (1500, 1280)
-        # TODO: Do we need the reshape to (batch_size, sequence_length, feature_size) or is it already in the right shape?
-        # inputs_embeds = ops.permute(inputs_embeds, [0, 2, 1])
+        # With permute=True the stem output is channel-first [batch, d_model,
+        # 1500]; move channels last to [batch, 1500, d_model] before adding the
+        # positional embeddings (B4 fix — this permute was previously commented
+        # out, which left the layout inconsistent with the conv config).
+        inputs_embeds = ops.permute(inputs_embeds, [0, 2, 1])
 
-        # Add sinusoidal position embeddings to the output of the stem
+        # embed_positions.weight is [1500, d_model] and broadcasts over batch.
         h = inputs_embeds + self.embed_positions.weight
 
         h = self.layers(h)
