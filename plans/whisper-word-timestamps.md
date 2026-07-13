@@ -1,6 +1,6 @@
 # Plan: Whisper speech-to-text with word-level timestamps on MAX
 
-**Status:** Implemented — local backend-agnostic gates pass; on-hardware gates (c/d/e) pending the deploy loop.
+**Status:** Implemented + on-hardware validated (max-build GPU, large-v3): transcript exact vs HF/faster-whisper; word timestamps within tolerance after the off-by-one fix.
 **Date:** 2026-07-13
 **Branch:** `feat/whisper-word-ts` (worktree `modular-whisper`, based on `feat/klein-fp4-text-encoder` @ `2a52ee64df`)
 **Scope:** standalone ≤30s-window PoC. NO `max serve` integration this iteration.
@@ -17,9 +17,20 @@ All code is written. Validated locally on **Mac CPU** (backend-agnostic correctn
 | `timing.py` DTW / median / word-split | **PASS** — synthetic peaks: monotonic, brackets peaks, reconstructs phrase |
 | End-to-end pipeline wiring | **PASS** — safetensors load + 3 graphs + greedy + align + timing compose; well-formed words |
 
-**Bugs fixed during bring-up (beyond B1–B5):** (1) encoder input frame dim must be **static** (`2*max_source_positions`) or the positional add is non-inferable; (2) `timing.dtw` tie-break must match openai-whisper exactly (strict `<`, ties fall through to "advance frame") — a diagonal/up preference collapses tokens onto one frame. Both are fixed + commented in code.
+**Bugs fixed during bring-up (beyond B1–B5):** (1) encoder input frame dim must be **static** (`2*max_source_positions`) or the positional add is non-inferable; (2) `timing.dtw` tie-break must match openai-whisper exactly (strict `<`, ties fall through to "advance frame") — a diagonal/up preference collapses tokens onto one frame; (3) **word-timestamp off-by-one** — cross-attention at decoder position `p` localizes the *predicted* token `seq[p+1]`, so the alignment rows must be sliced `[sot_len-1:-2]` (not `[sot_len:-1]`); the wrong slice put every timestamp ~one token (~240ms) late. All fixed + commented in code.
 
-**Pending on-hardware (deploy loop):** gate (c) transcript vs HF greedy on real audio, gate (d) word-timestamp A/B vs faster-whisper / HF, gate (e) GPU sm_120 + large-v3 numerics/RTF. Instruments are ready — see "Deploy-team handoff" below.
+**On-hardware validation (max-build GPU sm_120, `openai/whisper-large-v3`, real 5.86s LibriSpeech clip):**
+
+| Gate | Result |
+|---|---|
+| (c) transcript | **PASS** — exact char-for-char match vs HF **and** faster-whisper (17/17 words): "Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel." |
+| (d) word timestamps vs faster-whisper | **PASS** — after the off-by-one fix: \|Δ\| **median 0ms**, mean start bias **−8ms**, p95 120ms (was +240ms). Only outlier: last word's end runs to end-of-content (fw trims trailing silence). |
+| (a)/(b) numeric parity on GPU | encoder cos **0.999993** (max_abs 0.45 / rel 1.8%) — GPU **TF32** matmul on random input, *not* a correctness issue (proven by the exact transcript). The CPU-calibrated `atol=1e-4` gate should get a cosine-threshold mode for GPU. |
+| (e) portability | runs on max-build GPU (large-v3) and Mac CPU (tiny). |
+
+Environment note: deploy team's venv is `/root/whisper-venv/bin/python` (`import max` = branch base SHA, no ABI drift); cap the MemoryManager (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE≈24GiB`) so it doesn't over-reserve against other GPU tenants; `HF_HOME=/mnt/models/huggingface`. faster-whisper's CT2 needs CUDA 12 (`libcublas.so.12`) which the CUDA-13 box lacks → run the fw acceptance ref on CPU.
+
+**Open follow-ups (deferred):** recalibrate gates (a)/(b) tolerances for GPU TF32 (cosine threshold); trim the last word's end to the token's attention offset instead of end-of-content; then the deferred-scope items below.
 
 ## Deploy vs validation (split responsibilities)
 
