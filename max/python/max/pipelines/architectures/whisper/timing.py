@@ -201,8 +201,14 @@ def find_word_alignment(
     w = median_filter(w, median_width)
 
     matrix = w.mean(axis=0)  # [T_total, content_pos]
-    # Rows for the transcript tokens: drop the SOT prompt and the final EOT row.
-    matrix = matrix[sot_len:-1]
+    # Rows for the transcript tokens, accounting for the causal-decoder shift:
+    # the cross-attention at sequence position p localizes the token being
+    # PREDICTED (seq[p+1]), not the input token seq[p]. So the row that
+    # localizes text_token[i] is one position earlier — the row where the model
+    # was predicting it. Slice one back to `[sot_len-1 : -2]` (row i -> text
+    # token i). Using `[sot_len:-1]` instead makes every timestamp ~one token
+    # (~240ms) late — verified against faster-whisper and HF.
+    matrix = matrix[sot_len - 1 : -2]
     n_tok = matrix.shape[0]
     if n_tok == 0:
         return []
