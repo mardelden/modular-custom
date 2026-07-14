@@ -20,6 +20,8 @@ from .context import (
     GrammarMatcher,
     PixelContext,
     PixelGenerationContextType,
+    SpeechToTextContext,
+    SpeechToTextContextType,
     SpecDecodingState,
     StructuredOutputRegionDelimiters,
     TextAndVisionContext,
@@ -46,7 +48,12 @@ from .logit_processors_type import (
     LogitsProcessor,
     ProcessorInputs,
 )
-from .outputs import GenerationOutput, TextGenerationOutput
+from .outputs import (
+    GenerationOutput,
+    SpeechToTextOutput,
+    TextGenerationOutput,
+    TranscribedWord,
+)
 from .pixel_context_validators import (
     validate_flux2_max_pixel_area,
     validate_wan_max_pixel_area,
@@ -90,6 +97,10 @@ __all__ = [
     "SamplingParamsGenerationConfigDefaults",
     "SamplingParamsInput",
     "SpecDecodingState",
+    "SpeechToTextContext",
+    "SpeechToTextContextType",
+    "SpeechToTextOutput",
+    "TranscribedWord",
     "StructuredOutputRegionDelimiters",
     "TextAndVisionContext",
     "TextContext",

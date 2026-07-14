@@ -20,6 +20,9 @@ from .embeddings_generation import (
 from .pixel_generation import (
     PixelGenerationInputs,
 )
+from .speech_to_text import (
+    SpeechToTextInputs,
+)
 from .text_generation import (
     BatchType,
     ImageContentPart,
@@ -42,6 +45,7 @@ __all__ = [
     "ImageContentPart",
     "MessageContent",
     "PixelGenerationInputs",
+    "SpeechToTextInputs",
     "TextContentPart",
     "TextGenerationInputs",
     "TextGenerationRequest",
