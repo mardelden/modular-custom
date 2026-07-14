@@ -24,10 +24,6 @@ directly on ``InferenceSession``. Weights load from safetensors (no torch).
 
 from __future__ import annotations
 
-import glob
-import json
-import os
-
 import numpy as np
 
 from .audio import extract_features, load_audio
@@ -40,7 +36,15 @@ from .graph import (
     build_encoder_graph,
 )
 from .timing import find_word_alignment
-from .weight_adapters import _rename_decoder_key, _rename_encoder_key
+from .weight_adapters import (
+    _rename_decoder_key,
+    _rename_encoder_key,
+    load_raw_state_dict,
+    rename_state_dict,
+)
+
+# Back-compat alias: standalone harness scripts predate the factor-out.
+_load_raw_state_dict = load_raw_state_dict
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:
@@ -52,28 +56,6 @@ def _softmax(x: np.ndarray) -> np.ndarray:
 def _causal_mask(seq_len: int) -> np.ndarray:
     m = np.triu(np.full((seq_len, seq_len), NEG_INF, dtype=np.float32), k=1)
     return m[None, None, :, :]
-
-
-def _load_raw_state_dict(model_dir: str) -> dict[str, np.ndarray]:
-    """Load all safetensors shards under ``model_dir`` as a numpy state dict."""
-    from safetensors.numpy import load_file
-
-    single = os.path.join(model_dir, "model.safetensors")
-    index = os.path.join(model_dir, "model.safetensors.index.json")
-    sd: dict[str, np.ndarray] = {}
-    if os.path.exists(single):
-        sd.update(load_file(single))
-    elif os.path.exists(index):
-        with open(index) as f:
-            files = sorted(set(json.load(f)["weight_map"].values()))
-        for name in files:
-            sd.update(load_file(os.path.join(model_dir, name)))
-    else:
-        for path in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
-            sd.update(load_file(path))
-    if not sd:
-        raise FileNotFoundError(f"No safetensors weights found in {model_dir}")
-    return sd
 
 
 class WhisperTranscriber:
@@ -140,9 +122,9 @@ class WhisperTranscriber:
         self.session = InferenceSession(devices=[self.device])
 
         # Weights -> encoder/decoder state dicts (float32).
-        raw = _load_raw_state_dict(model_dir)
-        enc_sd = self._rename(raw, _rename_encoder_key)
-        dec_sd = self._rename(raw, _rename_decoder_key)
+        raw = load_raw_state_dict(model_dir)
+        enc_sd = rename_state_dict(raw, _rename_encoder_key)
+        dec_sd = rename_state_dict(raw, _rename_decoder_key)
 
         self.use_kv_cache = use_kv_cache
         self.encoder_model = self.session.load(
@@ -181,16 +163,6 @@ class WhisperTranscriber:
             ),
             weights_registry=dec_sd,
         )
-
-    @staticmethod
-    def _rename(raw, rename_fn) -> dict[str, np.ndarray]:
-        out: dict[str, np.ndarray] = {}
-        for key, arr in raw.items():
-            name = rename_fn(key)
-            if name is None:
-                continue
-            out[name] = np.asarray(arr, dtype=np.float32)
-        return out
 
     def _buf(self, arr: np.ndarray):
         from max.driver import Buffer

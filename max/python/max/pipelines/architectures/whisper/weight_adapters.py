@@ -26,10 +26,61 @@ drop the decoder's cross-attention.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import glob
+import json
+import os
+from collections.abc import Callable, Mapping
 
+import numpy as np
 from max.dtype import DType
 from max.graph.weights import WeightData, Weights
+
+
+def load_raw_state_dict(model_dir: str) -> dict[str, np.ndarray]:
+    """Load every safetensors shard under ``model_dir`` as a numpy state dict.
+
+    Handles the three on-disk layouts: a single ``model.safetensors``, a
+    sharded checkpoint described by ``model.safetensors.index.json``, or a bare
+    directory of ``*.safetensors`` files. Shared by the standalone
+    :class:`~.transcribe.WhisperTranscriber` and the served
+    :class:`~.executor.WhisperExecutor`.
+    """
+    from safetensors.numpy import load_file
+
+    single = os.path.join(model_dir, "model.safetensors")
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    sd: dict[str, np.ndarray] = {}
+    if os.path.exists(single):
+        sd.update(load_file(single))
+    elif os.path.exists(index):
+        with open(index) as f:
+            files = sorted(set(json.load(f)["weight_map"].values()))
+        for name in files:
+            sd.update(load_file(os.path.join(model_dir, name)))
+    else:
+        for path in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+            sd.update(load_file(path))
+    if not sd:
+        raise FileNotFoundError(f"No safetensors weights found in {model_dir}")
+    return sd
+
+
+def rename_state_dict(
+    raw: Mapping[str, np.ndarray],
+    rename_fn: Callable[[str], str | None],
+) -> dict[str, np.ndarray]:
+    """Apply ``rename_fn`` to every key, dropping ``None`` results, casting f32.
+
+    ``rename_fn`` is one of :func:`_rename_encoder_key` / :func:`_rename_decoder_key`
+    — it maps an HF key to its MAX FQN or returns ``None`` to drop it.
+    """
+    out: dict[str, np.ndarray] = {}
+    for key, arr in raw.items():
+        name = rename_fn(key)
+        if name is None:
+            continue
+        out[name] = np.asarray(arr, dtype=np.float32)
+    return out
 
 
 def _rename_encoder_key(name: str) -> str | None:
