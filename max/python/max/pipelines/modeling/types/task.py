@@ -51,6 +51,7 @@ class InputModality(str, Enum):
     TEXT = "text"
     IMAGE = "image"
     VIDEO = "video"
+    AUDIO = "audio"
 
 
 class PipelineTask(str, Enum):
@@ -62,5 +63,7 @@ class PipelineTask(str, Enum):
     """Task for generating embeddings."""
     PIXEL_GENERATION = "pixel_generation"
     """Task for generating pixels."""
+    SPEECH_TO_TEXT = "speech_to_text"
+    """Task for transcribing audio to text (with optional word timestamps)."""
     UNDEFINED = "undefined"
     """Undefined task, used as default when task should be auto-detected."""

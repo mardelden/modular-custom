@@ -1319,6 +1319,48 @@ class PixelContext:
         )
 
 
+@dataclass(kw_only=True)
+class SpeechToTextContext:
+    """A model-ready context for a speech-to-text (Whisper) request.
+
+    Like :class:`PixelContext`, this carries only the numeric data the model
+    executes against — the audio bytes are decoded to a log-mel spectrogram by
+    the serving tokenizer's ``new_context``. One-shot: the executor produces the
+    full transcription in a single ``execute`` (no incremental status updates).
+    """
+
+    mel: npt.NDArray[np.float32]
+    """Log-mel features ``[num_mel_bins, 3000]`` (float32); rides the ZMQ OOB path."""
+
+    num_content_frames: int
+    """Number of real (non-padded) mel frames — crops trailing silence in DTW."""
+
+    duration_s: float = 0.0
+    """Audio duration in seconds (for the response ``duration`` field)."""
+
+    language: str = "en"
+    """Transcription language (also groups the dynamic batch)."""
+
+    prompt_tokens: list[int] = field(default_factory=list)
+    """The SOT prompt token ids (built API-side by the tokenizer)."""
+
+    word_timestamps: bool = True
+    """Whether to run the alignment pass and return per-word timestamps."""
+
+    model_name: str = field(default="")
+    request_id: RequestID = field(default_factory=RequestID)
+    status: GenerationStatus = field(default=GenerationStatus.ACTIVE)
+
+    @property
+    def is_done(self) -> bool:
+        """Whether the request has completed."""
+        return self.status.is_done
+
+    def compute_num_available_steps(self, max_seq_len: int) -> int:
+        """Scheduler-compatibility shim (one-shot; not a token loop)."""
+        return max_seq_len
+
+
 # ---------------------------------------------------------------------------
 # Context TypeVars (bound to concrete implementations)
 # ---------------------------------------------------------------------------
@@ -1336,3 +1378,8 @@ PixelGenerationContextType = TypeVar(
     "PixelGenerationContextType", bound=PixelContext
 )
 """Type variable for pixel generation context types, constrained to PixelContext."""
+
+SpeechToTextContextType = TypeVar(
+    "SpeechToTextContextType", bound=SpeechToTextContext
+)
+"""Type variable for speech-to-text context types, constrained to SpeechToTextContext."""

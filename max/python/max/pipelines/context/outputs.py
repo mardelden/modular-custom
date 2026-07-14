@@ -90,6 +90,48 @@ class TextGenerationOutput:
         )
 
 
+@dataclass
+class TranscribedWord:
+    """One word of a transcription with its time span and confidence."""
+
+    word: str
+    start: float
+    end: float
+    probability: float
+
+
+@dataclass(kw_only=True)
+class SpeechToTextOutput:
+    """Output of a speech-to-text (Whisper) transcription.
+
+    A plain dataclass (like :class:`TextGenerationOutput`) so it crosses the
+    worker ZMQ boundary via msgspec natively — no pydantic registration needed.
+    """
+
+    request_id: RequestID
+    """The unique identifier for the transcription request."""
+
+    final_status: GenerationStatus
+    """The final status of the transcription (always terminal — one-shot)."""
+
+    text: str
+    """The transcribed text."""
+
+    language: str = "en"
+    """The transcription language."""
+
+    duration: float = 0.0
+    """The audio duration in seconds."""
+
+    words: list[TranscribedWord] | None = None
+    """Optional per-word timestamps (present iff word timestamps were requested)."""
+
+    @property
+    def is_done(self) -> bool:
+        """Speech-to-text is one-shot; the result is always complete."""
+        return self.final_status.is_done
+
+
 class GenerationOutput(BaseModel):
     """Output container for image generation pipeline operations.
 
