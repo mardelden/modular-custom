@@ -2840,3 +2840,116 @@ async def unload_lora_adapter(
         raise HTTPException(
             status_code=500, detail=f"Failed to unload LoRA adapter: {str(e)}"
         ) from e
+
+
+# Max upload size for an audio file (a 30s clip is well under this).
+_MAX_TRANSCRIPTION_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+@router.post("/audio/transcriptions", response_model=None)
+async def openai_create_transcription(request: Request) -> Response:
+    """OpenAI-compatible speech-to-text: transcribe a single <=30s audio window.
+
+    Multipart form fields: ``file`` (required audio upload), ``model``,
+    ``language``, ``response_format`` (``json`` | ``verbose_json`` | ``text``),
+    and ``timestamp_granularities[]`` (include ``word`` for per-word
+    timestamps). Long audio must be chunked into <=30s segments client-side and
+    posted concurrently.
+    """
+    from max.pipelines.architectures.whisper.serve_tokenizer import (
+        TranscriptionRequest,
+    )
+
+    try:
+        form = await request.form()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail="Malformed multipart form."
+        ) from e
+
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "read"):
+        raise HTTPException(
+            status_code=400, detail="Missing required 'file' upload."
+        )
+    model = str(form.get("model") or "")
+    language = form.get("language") or None
+    response_format = str(form.get("response_format") or "json")
+    if response_format not in ("json", "verbose_json", "text"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported response_format {response_format!r}; expected "
+                "'json', 'verbose_json', or 'text'."
+            ),
+        )
+    granularities = form.getlist("timestamp_granularities[]") or form.getlist(
+        "timestamp_granularities"
+    )
+    want_words = "word" in granularities
+
+    raw = await upload.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded audio is empty.")
+    if len(raw) > _MAX_TRANSCRIPTION_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Audio exceeds the "
+                f"{_MAX_TRANSCRIPTION_UPLOAD_BYTES // (1024 * 1024)}MB upload "
+                "limit."
+            ),
+        )
+
+    transcription_request = TranscriptionRequest(
+        audio_bytes=raw,
+        model=model,
+        language=language if language is None else str(language),
+        response_format=response_format,
+        word_timestamps=want_words,
+    )
+
+    generator = request.app.state.handler.next(transcription_request)
+    try:
+        output = await anext(generator)
+        while not output.is_done:
+            output = await anext(generator)
+    except InputError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except StopAsyncIteration as e:
+        raise HTTPException(
+            status_code=500, detail="Transcription produced no output."
+        ) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(
+            "Transcription failed for request %s",
+            transcription_request.request_id.value,
+        )
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    if output.final_status == GenerationStatus.ACTIVE:
+        raise HTTPException(
+            status_code=500, detail="Transcription was cancelled."
+        )
+
+    if response_format == "text":
+        return Response(content=output.text, media_type="text/plain")
+
+    if response_format == "verbose_json":
+        body: dict[str, Any] = {
+            "task": "transcribe",
+            "language": output.language,
+            "duration": output.duration,
+            "text": output.text,
+        }
+        if output.words is not None:
+            body["words"] = [
+                {"word": w.word, "start": w.start, "end": w.end}
+                for w in output.words
+            ]
+    else:
+        body = {"text": output.text}
+
+    return JSONResponse(content=body, status_code=200)

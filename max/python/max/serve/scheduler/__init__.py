@@ -22,10 +22,11 @@ _logger = logging.getLogger("max.pipelines")
 from max.pipelines.context import (
     BaseContextType,
     PixelContext,
+    SpeechToTextContext,
     TextContext,
     TextGenerationOutput,
 )
-from max.pipelines.context.outputs import GenerationOutput
+from max.pipelines.context.outputs import GenerationOutput, SpeechToTextOutput
 from max.pipelines.diffusion.pipeline import (
     PixelGenerationPipeline,
 )
@@ -42,7 +43,9 @@ from max.pipelines.modeling.types import (
     PipelineOutputType,
     PixelGenerationInputs,
     RequestID,
+    SpeechToTextInputs,
 )
+from max.pipelines.speech.pipeline import SpeechToTextPipeline
 from max.serve.config import Settings
 from max.serve.queue import MAXPullQueue, MAXPushQueue
 from max.serve.scheduler.interface import Scheduler
@@ -138,6 +141,47 @@ def load_scheduler(
             cancel_queue=cancel_queue,
             max_batch_size=pipeline.max_batch_size,
             batch_key=batch_key,
+        )
+    elif pipeline.__class__.__name__ == "SpeechToTextPipeline":
+        speech_pipeline = cast(SpeechToTextPipeline[Any], pipeline)
+
+        def stt_batch_constructor(
+            contexts: list[SpeechToTextContext],
+        ) -> SpeechToTextInputs[Any]:
+            """Collate one or more SpeechToTextContexts into batched inputs."""
+            return SpeechToTextInputs(
+                batch={context.request_id: context for context in contexts}
+            )
+
+        def stt_batch_key(context: SpeechToTextContext) -> Hashable:
+            """Group requests one lockstep batched decode can serve.
+
+            The batched decode shares one SOT prompt (language) and one output
+            shape (word timestamps on/off), so requests batch only when both
+            match; everything else (the fixed 30s mel window) is uniform.
+            """
+            return (context.language, context.word_timestamps)
+
+        return OneShotScheduler[
+            SpeechToTextContext,
+            SpeechToTextInputs[Any],
+            SpeechToTextOutput,
+        ](
+            pipeline=speech_pipeline,
+            batch_constructor=stt_batch_constructor,
+            request_queue=cast(
+                MAXPullQueue[SpeechToTextContext],
+                request_queue,
+            ),
+            response_queue=cast(
+                MAXPushQueue[
+                    dict[RequestID, SchedulerResult[SpeechToTextOutput]]
+                ],
+                response_queue,
+            ),
+            cancel_queue=cancel_queue,
+            max_batch_size=pipeline.max_batch_size,
+            batch_key=stt_batch_key,
         )
     elif pipeline.__class__.__name__ == "EmbeddingsPipeline":
         embeddings_scheduler_config = EmbeddingsSchedulerConfig(

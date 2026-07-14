@@ -209,7 +209,10 @@ def _response_type_for_task(
 ) -> type[Any]:
     """Maps a PipelineTask to the correct msgspec response type for ZMQ deserialization."""
     from max.pipelines.context import TextGenerationOutput
-    from max.pipelines.context.outputs import GenerationOutput
+    from max.pipelines.context.outputs import (
+        GenerationOutput,
+        SpeechToTextOutput,
+    )
     from max.pipelines.modeling.types.pipeline_variants import (
         EmbeddingsGenerationOutput,
     )
@@ -220,6 +223,8 @@ def _response_type_for_task(
         return dict[RequestID, SchedulerResult[EmbeddingsGenerationOutput]]
     elif pipeline_task == PipelineTask.PIXEL_GENERATION:
         return dict[RequestID, SchedulerResult[GenerationOutput]]
+    elif pipeline_task == PipelineTask.SPEECH_TO_TEXT:
+        return dict[RequestID, SchedulerResult[SpeechToTextOutput]]
     else:
         raise ValueError(
             f"PipelineTask ({pipeline_task}) does not have a response type defined."

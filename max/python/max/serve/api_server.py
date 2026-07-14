@@ -199,6 +199,14 @@ async def lifespan(
                 model_worker=model_worker,
                 lora_queue=lora_queue,
             ),
+            # Speech-to-text uses the /v1/audio/transcriptions route via
+            # GeneralPipelineHandler (submit context -> await one-shot output).
+            PipelineTask.SPEECH_TO_TEXT: lambda: GeneralPipelineHandler(
+                model_name=serving_settings.pipeline_config.models.model_name,
+                tokenizer=serving_settings.tokenizer,
+                model_worker=model_worker,
+                lora_queue=lora_queue,
+            ),
         }[serving_settings.task]()
 
         # Store pipeline (may be GeneralPipelineHandler or modality-specific wrapper)
@@ -210,7 +218,10 @@ async def lifespan(
         # Also store as handler for OpenResponses API route compatibility
         # For pixel generation, this is the same as pipeline
         # For other tasks, we also create a separate handler instance
-        if serving_settings.task == PipelineTask.PIXEL_GENERATION:
+        if serving_settings.task in (
+            PipelineTask.PIXEL_GENERATION,
+            PipelineTask.SPEECH_TO_TEXT,
+        ):
             app.state.handler = pipeline
         else:
             app.state.handler = GeneralPipelineHandler(
