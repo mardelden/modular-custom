@@ -305,6 +305,9 @@ def register_all_models() -> None:
         ),
         _LazyArch("WanPipeline", ".wan", "wan_arch"),
         _LazyArch("WanImageToVideoPipeline", ".wan", "wan_i2v_arch"),
+        _LazyArch(
+            "WhisperForConditionalGeneration", ".whisper.arch", "whisper_arch"
+        ),
         _LazyArch("ZImagePipeline", ".z_image_modulev3", "z_image_arch"),
     ]
 

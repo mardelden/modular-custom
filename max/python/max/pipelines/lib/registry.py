@@ -54,6 +54,7 @@ if TYPE_CHECKING:
 
 from max.driver import load_devices
 from max.pipelines.diffusion.pipeline import PixelGenerationPipeline
+from max.pipelines.speech.pipeline import SpeechToTextPipeline
 from max.pipelines.lib._hf_config import load_huggingface_config
 from max.pipelines.lib.memory_estimation import MemoryEstimator, _MemoryPlan
 from max.pipelines.modeling.config_enums import RopeType, SupportedEncoding
@@ -85,6 +86,7 @@ def get_pipeline_for_task(
     type[TextGenerationPipeline[TextContext]]
     | type[EmbeddingsPipeline]
     | type[PixelGenerationPipeline[Any]]
+    | type[SpeechToTextPipeline[Any]]
     | type[OverlapTextGenerationPipeline[TextContext]]
 ):
     """Returns the pipeline class for the given task and config.
@@ -122,6 +124,8 @@ def get_pipeline_for_task(
         return EmbeddingsPipeline
     elif task == PipelineTask.PIXEL_GENERATION:
         return PixelGenerationPipeline
+    elif task == PipelineTask.SPEECH_TO_TEXT:
+        return SpeechToTextPipeline
     else:
         raise ValueError(f"Unsupported pipeline task: {task}")
 
@@ -1083,6 +1087,47 @@ class PipelineRegistry:
             raise ValueError(
                 f"No architecture found for {pipeline_config.models.main_architecture_name}"
             )
+
+        # Speech-to-text (Whisper) is a one-shot executor that owns a private,
+        # fixed-size decoder cache. It needs neither the paged-KV resolution nor
+        # the LLM memory planner / overlap scheduler that the shared path below
+        # runs (and which trip on an encoder-decoder's "main" HF config). Branch
+        # here — right after arch resolution — and do only the model-config
+        # resolution the executor + session require.
+        if task == PipelineTask.SPEECH_TO_TEXT:
+            try:
+                pipeline_config.resolve(arch)
+            except Exception:
+                logger.warning(
+                    "Full pipeline_config.resolve() failed for the "
+                    "speech-to-text architecture; falling back to "
+                    "manifest-only resolution.",
+                    exc_info=True,
+                )
+                pipeline_config.models.resolve()
+
+            first_config = next(iter(pipeline_config.models.values()))
+            tokenizer = arch.tokenizer(
+                model_path=first_config.model_path,
+                pipeline_config=pipeline_config,
+                revision=first_config.huggingface_model_revision,
+                trust_remote_code=first_config.trust_remote_code,
+            )
+            pipeline_class = get_pipeline_for_task(task, pipeline_config)
+            if arch.pipeline_cls is not None:
+                pipeline_class = arch.pipeline_cls
+            speech_factory_kwargs: dict[str, Any] = {
+                "pipeline_config": pipeline_config,
+                "pipeline_model": arch.pipeline_model,
+            }
+            pipeline_factory = cast(
+                Callable[[], PipelineTypes],
+                functools.partial(pipeline_class, **speech_factory_kwargs),
+            )
+            typed_tokenizer = cast(
+                PipelineTokenizer[Any, Any, Any], tokenizer
+            )
+            return typed_tokenizer, pipeline_factory
 
         # For speculative decoding, pre-resolve the draft architecture before
         # calling resolve() so config.py never needs a registry import.

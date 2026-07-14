@@ -25,18 +25,23 @@ HOP_LENGTH = 160  # mel-frame hop; SAMPLE_RATE / HOP_LENGTH = 100 frames/sec
 N_FRAMES = 3000  # 30s * 100 frames/sec (the encoder's fixed input length)
 
 
-def load_audio(path: str, target_sr: int = SAMPLE_RATE) -> np.ndarray:
-    """Load ``path`` as a mono float32 waveform resampled to ``target_sr``."""
+def _decode_waveform(src, target_sr: int) -> np.ndarray:
+    """Decode ``src`` (a path or a binary file-like) to a mono float32 waveform.
+
+    ``soundfile`` handles both a filesystem path and any ``read``-able binary
+    stream (e.g. ``io.BytesIO`` over an uploaded file); the ``wave`` fallback
+    covers the soundfile-absent case for plain PCM WAV.
+    """
     data: np.ndarray
     sr: int
     try:
         import soundfile as sf
 
-        data, sr = sf.read(path, dtype="float32", always_2d=False)
+        data, sr = sf.read(src, dtype="float32", always_2d=False)
     except Exception:
         import wave
 
-        with wave.open(path, "rb") as wf:
+        with wave.open(src, "rb") as wf:
             sr = wf.getframerate()
             n_channels = wf.getnchannels()
             raw = wf.readframes(wf.getnframes())
@@ -64,6 +69,22 @@ def load_audio(path: str, target_sr: int = SAMPLE_RATE) -> np.ndarray:
             )
 
     return np.ascontiguousarray(data, dtype=np.float32)
+
+
+def load_audio(path: str, target_sr: int = SAMPLE_RATE) -> np.ndarray:
+    """Load ``path`` as a mono float32 waveform resampled to ``target_sr``."""
+    return _decode_waveform(path, target_sr)
+
+
+def load_audio_bytes(raw: bytes, target_sr: int = SAMPLE_RATE) -> np.ndarray:
+    """Decode in-memory audio ``raw`` bytes to a mono float32 waveform.
+
+    The server front-end passes the uploaded file's bytes straight through
+    without touching the filesystem.
+    """
+    import io
+
+    return _decode_waveform(io.BytesIO(raw), target_sr)
 
 
 def extract_features(
