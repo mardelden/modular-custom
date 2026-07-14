@@ -1,0 +1,25 @@
+load("//bazel:api.bzl", "modular_py_library")
+
+package(default_visibility = ["//max:consumers"])
+
+modular_py_library(
+    name = "speech",
+    srcs = glob(["**/*.py"]),
+    ignore_unresolved_imports = [
+        # lib depends on speech at runtime (registry imports
+        # SpeechToTextPipeline), so speech cannot depend on lib — that would be
+        # a circular Bazel dep. These imports are TYPE_CHECKING-only.
+        "max.pipelines.lib.config.PipelineConfig",
+        "max.pipelines.lib.pipeline_executor.PipelineExecutor",
+    ],
+    # lib depends on speech at runtime, so speech cannot depend on lib; the
+    # TYPE_CHECKING imports of PipelineConfig/PipelineExecutor from lib
+    # therefore cannot be resolved by mypy when building this target alone.
+    tags = ["no-mypy"],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/engine",
+        "//max/python/max/pipelines/context",
+        "//max/python/max/pipelines/modeling",
+    ],
+)
