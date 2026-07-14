@@ -203,6 +203,15 @@ class WhisperExecutor(
         self._device = load_devices(main.device_specs)[0]
         device_ref = DeviceRef.from_device(self._device)
 
+        # Reusable self-attention KV-cache buffers, keyed by batch size. The
+        # cache is written before it is read every step (prefill writes the SOT
+        # slots, each step writes its own slot; the additive mask only ever
+        # attends 0..cache_len), so buffers can be reused across execute() calls
+        # with no re-zeroing — avoiding a ~1.2GB H2D re-alloc per call.
+        self._kv_pool: dict[
+            int, tuple[list[Buffer], list[Buffer]]
+        ] = {}
+
         # Compute dtype: bf16 is opt-in via the model encoding; default f32.
         # Staged bf16 rollout — this applies bf16 to the ENCODER only: it casts
         # its output back to f32, so cross-KV / cached-decode / align stay f32
@@ -402,15 +411,21 @@ class WhisperExecutor(
 
         t_setup = time.perf_counter()
         cross_k, cross_v = self.cross_kv_model.execute(self._buf(enc))
-        zeros = np.zeros((batch, n_heads, max_t, head_dim), dtype=np.float32)
-        k_bufs = [
-            Buffer.from_numpy(zeros.copy()).to(self._device)
-            for _ in range(n_layers)
-        ]
-        v_bufs = [
-            Buffer.from_numpy(zeros.copy()).to(self._device)
-            for _ in range(n_layers)
-        ]
+        if batch not in self._kv_pool:
+            zeros = np.zeros(
+                (batch, n_heads, max_t, head_dim), dtype=np.float32
+            )
+            self._kv_pool[batch] = (
+                [
+                    Buffer.from_numpy(zeros.copy()).to(self._device)
+                    for _ in range(n_layers)
+                ],
+                [
+                    Buffer.from_numpy(zeros.copy()).to(self._device)
+                    for _ in range(n_layers)
+                ],
+            )
+        k_bufs, v_bufs = self._kv_pool[batch]
         split = {"setup": time.perf_counter() - t_setup, "device": 0.0}
 
         def run(
