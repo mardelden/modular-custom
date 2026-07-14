@@ -279,6 +279,7 @@ class WhisperExecutor(
     def execute(self, inputs: WhisperExecInputs) -> WhisperExecResult:
         meta = inputs._meta
         batch = len(meta)
+        logger.info("WhisperExecutor.execute: batch_size=%d", batch)
         # batch_key groups by (language, word_timestamps), so the SOT prompt is
         # identical across rows — take row 0's (or rebuild from its language).
         sot = meta[0].prompt_tokens or self._build_sot(meta[0].language)
