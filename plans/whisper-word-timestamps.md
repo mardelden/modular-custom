@@ -1,6 +1,6 @@
 # Plan: Whisper speech-to-text with word-level timestamps on MAX
 
-**Status:** Implemented + on-hardware validated (max-build GPU, large-v3): transcript exact vs HF/faster-whisper; word timestamps within tolerance after the off-by-one fix.
+**Status:** Implemented + on-hardware validated (max-build GPU, large-v3) — **all gates green**: transcript exact vs HF/faster-whisper; word timestamps median 0ms vs faster-whisper; encoder/decoder parity pass on the GPU-TF32 cosine gate.
 **Date:** 2026-07-13
 **Branch:** `feat/whisper-word-ts` (worktree `modular-whisper`, based on `feat/klein-fp4-text-encoder` @ `2a52ee64df`)
 **Scope:** standalone ≤30s-window PoC. NO `max serve` integration this iteration.
@@ -24,13 +24,13 @@ All code is written. Validated locally on **Mac CPU** (backend-agnostic correctn
 | Gate | Result |
 |---|---|
 | (c) transcript | **PASS** — exact char-for-char match vs HF **and** faster-whisper (17/17 words): "Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel." |
-| (d) word timestamps vs faster-whisper | **PASS** — after the off-by-one fix: \|Δ\| **median 0ms**, mean start bias **−8ms**, p95 120ms (was +240ms). Only outlier: last word's end runs to end-of-content (fw trims trailing silence). |
-| (a)/(b) numeric parity on GPU | encoder cos **0.999993** (max_abs 0.45 / rel 1.8%) — GPU **TF32** matmul on random input, *not* a correctness issue (proven by the exact transcript). The CPU-calibrated `atol=1e-4` gate should get a cosine-threshold mode for GPU. |
+| (d) word timestamps vs faster-whisper | **PASS** — \|Δ\| **median 0ms**, p95 120ms (was +240ms) after the off-by-one fix; last word's end bounded at the EOT onset (5.34 vs 5.84, fw 5.08). |
+| (a)/(b) numeric parity on GPU | **PASS** — via the GPU-TF32 cosine gate: encoder cos **0.999993**; decoder argmax **100%**, logit cos 1.0, align cos 0.999999. (Raw magnitude drift is TF32, not a correctness issue — proven by the exact transcript.) |
 | (e) portability | runs on max-build GPU (large-v3) and Mac CPU (tiny). |
 
 Environment note: deploy team's venv is `/root/whisper-venv/bin/python` (`import max` = branch base SHA, no ABI drift); cap the MemoryManager (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE≈24GiB`) so it doesn't over-reserve against other GPU tenants; `HF_HOME=/mnt/models/huggingface`. faster-whisper's CT2 needs CUDA 12 (`libcublas.so.12`) which the CUDA-13 box lacks → run the fw acceptance ref on CPU.
 
-**Open follow-ups (deferred):** recalibrate gates (a)/(b) tolerances for GPU TF32 (cosine threshold); trim the last word's end to the token's attention offset instead of end-of-content; then the deferred-scope items below.
+**Open follow-ups (deferred):** only the deferred-scope items below (KV-cached decode, bf16, >30s chunking, language autodetect, serve integration, …). The GPU-TF32 gate recalibration and the last-word-end trim are **done**.
 
 ## Deploy vs validation (split responsibilities)
 
