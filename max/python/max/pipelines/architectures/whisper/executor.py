@@ -213,9 +213,10 @@ class WhisperExecutor(
         ] = {}
 
         # Compute dtype: bf16 is opt-in via the model encoding; default f32.
-        # Staged bf16 rollout — this applies bf16 to the ENCODER only: it casts
-        # its output back to f32, so cross-KV / cached-decode / align stay f32
-        # and need no bf16 KV-cache buffers. (Decoder bf16 is the next step.)
+        # Applies to the whole model (encoder + decoder). Graph inputs that come
+        # from the host (mel, mask, encoder states) stay f32 and are cast inside
+        # each graph; logits + alignment probs are cast back to f32 on the way
+        # out (so the host loop never handles bf16 — there's no numpy bf16 here).
         encoding = getattr(main, "quantization_encoding", None) or "float32"
         if encoding not in ("float32", "bfloat16"):
             logger.warning(
@@ -223,33 +224,30 @@ class WhisperExecutor(
                 encoding,
             )
             encoding = "float32"
-        self._enc_dtype = supported_encoding_dtype(encoding)
+        self._dtype = supported_encoding_dtype(encoding)
 
-        # Weights -> encoder/decoder numpy state dicts (encoder may be bf16;
-        # decoder stays f32 for now).
+        # Weights -> encoder/decoder state dicts in the compute dtype.
         raw = load_raw_state_dict(model_dir)
         enc_sd = rename_state_dict(
-            raw, _rename_encoder_key, dtype=self._enc_dtype
+            raw, _rename_encoder_key, dtype=self._dtype
         )
-        dec_sd = rename_state_dict(raw, _rename_decoder_key)
+        dec_sd = rename_state_dict(
+            raw, _rename_decoder_key, dtype=self._dtype
+        )
 
         # Four compiled graphs on the injected session: encoder, cross-KV
         # precompute, unified KV-cached step graph, and teacher-forced align.
         self.encoder_model = session.load(
-            build_encoder_graph(
-                enc_sd, self.config, self._enc_dtype, device_ref
-            ),
+            build_encoder_graph(enc_sd, self.config, self._dtype, device_ref),
             weights_registry=enc_sd,
         )
         self.cross_kv_model = session.load(
-            build_cross_kv_graph(
-                dec_sd, self.config, DType.float32, device_ref
-            ),
+            build_cross_kv_graph(dec_sd, self.config, self._dtype, device_ref),
             weights_registry=dec_sd,
         )
         self.cached_model = session.load(
             build_decoder_cached_graph(
-                dec_sd, self.config, DType.float32, device_ref
+                dec_sd, self.config, self._dtype, device_ref
             ),
             weights_registry=dec_sd,
         )
@@ -257,7 +255,7 @@ class WhisperExecutor(
             build_decoder_align_graph(
                 dec_sd,
                 self.config,
-                DType.float32,
+                self._dtype,
                 device_ref,
                 self.alignment_heads,
             ),
@@ -412,16 +410,18 @@ class WhisperExecutor(
         t_setup = time.perf_counter()
         cross_k, cross_v = self.cross_kv_model.execute(self._buf(enc))
         if batch not in self._kv_pool:
-            zeros = np.zeros(
-                (batch, n_heads, max_t, head_dim), dtype=np.float32
-            )
+            # Zeroed so unwritten cache slots contribute finite (0) scores under
+            # the additive mask (garbage/NaN would survive the -1e9 mask and
+            # poison the softmax). Buffer.zeros allocates in the compute dtype
+            # directly on device — no numpy (this build has no bf16 numpy).
+            shape = [batch, n_heads, max_t, head_dim]
             self._kv_pool[batch] = (
                 [
-                    Buffer.from_numpy(zeros.copy()).to(self._device)
+                    Buffer.zeros(shape, self._dtype, self._device)
                     for _ in range(n_layers)
                 ],
                 [
-                    Buffer.from_numpy(zeros.copy()).to(self._device)
+                    Buffer.zeros(shape, self._dtype, self._device)
                     for _ in range(n_layers)
                 ],
             )

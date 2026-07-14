@@ -177,6 +177,9 @@ class WhisperDecoder(Module):
         ffn_dim = huggingface_config.decoder_ffn_dim
         self.return_alignment = return_alignment
         self.alignment_heads = list(alignment_heads or [])
+        # Compute dtype (may be bf16). Graph inputs (mask, encoder_states) stay
+        # f32 and are cast to this at entry; logits/align are cast back to f32.
+        self.dtype = dtype
 
         self.embed_tokens = Embedding(
             vocab_size=huggingface_config.vocab_size,
@@ -206,6 +209,9 @@ class WhisperDecoder(Module):
         mask: TensorValue,
         encoder_states: TensorValue,
     ) -> tuple[TensorValue, ...]:
+        # f32 graph inputs -> compute dtype (no-op for f32).
+        mask = ops.cast(mask, self.dtype)
+        encoder_states = ops.cast(encoder_states, self.dtype)
         h = self.embed_tokens(tokens) + self.embed_positions(positions)
 
         cross_probs_all: list[TensorValue] = []
@@ -343,6 +349,8 @@ class WhisperCrossKV(Module):
         super().__init__()
         d_model = huggingface_config.d_model
         n_heads = huggingface_config.decoder_attention_heads
+        # f32 encoder states are cast to this compute dtype at entry.
+        self.dtype = dtype
 
         class _Layer(Module):
             def __init__(self) -> None:
@@ -359,6 +367,7 @@ class WhisperCrossKV(Module):
         )
 
     def __call__(self, encoder_states):
+        encoder_states = ops.cast(encoder_states, self.dtype)
         ks, vs = [], []
         for layer in self.layers:
             k, v = layer(encoder_states)
@@ -422,6 +431,9 @@ class WhisperDecoderCached(Module):
         d_model = huggingface_config.d_model
         n_heads = huggingface_config.decoder_attention_heads
         ffn_dim = huggingface_config.decoder_ffn_dim
+        # f32 mask is cast to this compute dtype at entry (cross_k/v + self-KV
+        # buffers already arrive in this dtype); logits are cast back to f32.
+        self.dtype = dtype
         self.embed_tokens = Embedding(
             vocab_size=huggingface_config.vocab_size,
             hidden_dim=d_model,
@@ -455,6 +467,7 @@ class WhisperDecoderCached(Module):
         k_bufs,
         v_bufs,
     ):
+        mask = ops.cast(mask, self.dtype)  # f32 graph input -> compute dtype
         h = self.embed_tokens(tokens) + self.embed_positions(positions)
         for i, layer in enumerate(self.layers):
             h = layer(

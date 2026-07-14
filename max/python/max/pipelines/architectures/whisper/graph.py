@@ -185,25 +185,23 @@ def build_decoder_cached_graph(
     head_dim = cfg.d_model // n_heads
     max_t = cfg.max_target_positions
 
+    # Host-built tensors stay f32 (mask); tokens/positions int32; cache_len is a
+    # CPU int64 scalar. The K/V that flow between the cross-KV graph and the
+    # self-attention cache are the model compute dtype (``dtype``) — bf16 when
+    # requested — so they never round-trip through numpy (no bf16 numpy bridge).
     tokens_t = TensorType(DType.int32, ["batch", "t_new"], device=device)
     positions_t = TensorType(DType.int32, ["batch", "t_new"], device=device)
     mask_t = TensorType(DType.float32, [1, 1, "t_new", max_t], device=device)
     cache_len_t = TensorType(DType.int64, [], device=DeviceRef.CPU())
     cross_shape = ["batch", n_heads, cfg.max_source_positions, head_dim]
-    cross_k_t = TensorType(
-        DType.float32, [n_layers, *cross_shape], device=device
-    )
-    cross_v_t = TensorType(
-        DType.float32, [n_layers, *cross_shape], device=device
-    )
+    cross_k_t = TensorType(dtype, [n_layers, *cross_shape], device=device)
+    cross_v_t = TensorType(dtype, [n_layers, *cross_shape], device=device)
     cache_shape = ["batch", n_heads, max_t, head_dim]
     self_k_ts = [
-        BufferType(DType.float32, cache_shape, device=device)
-        for _ in range(n_layers)
+        BufferType(dtype, cache_shape, device=device) for _ in range(n_layers)
     ]
     self_v_ts = [
-        BufferType(DType.float32, cache_shape, device=device)
-        for _ in range(n_layers)
+        BufferType(dtype, cache_shape, device=device) for _ in range(n_layers)
     ]
     input_types = [
         tokens_t,
