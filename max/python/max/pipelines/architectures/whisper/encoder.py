@@ -152,6 +152,11 @@ class WhisperEncoder(Module):
         self, huggingface_config: AutoConfig, dtype: DType, device: DeviceRef
     ) -> None:
         super().__init__()
+        # Compute dtype (may be bf16); the graph input stays f32 and is cast to
+        # this at entry, and the output is cast back to f32 (see __call__), so
+        # the encoder's internal precision is decoupled from the rest of the
+        # pipeline (cross-KV / decoder / align all keep the f32 encoder states).
+        self.dtype = dtype
         # permute=True keeps the checkpoint's PyTorch conv layout: weights are
         # (out_channels, in_channels, kernel) and input/output stay channel-
         # first [batch, channels, length]. This lets the HF conv weights load
@@ -202,6 +207,9 @@ class WhisperEncoder(Module):
         Args:
             input_features: Buffer of shape (batch_size, feature_size, sequence_length)
         """
+        # Cast the f32 mel input to the compute dtype (no-op when dtype is f32).
+        input_features = ops.cast(input_features, self.dtype)
+
         # Encoder stem: two convolution layers and the GELU activation function.
         # input_features is [batch, num_mel_bins, 3000]; conv1 (stride 1) keeps
         # the length, conv2 (stride 2) halves it -> [batch, d_model, 1500].

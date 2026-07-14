@@ -68,7 +68,9 @@ whisper_arch = SupportedArchitecture(
     task=PipelineTask.SPEECH_TO_TEXT,
     input_modalities={InputModality.AUDIO},
     default_encoding="float32",
-    supported_encodings={"float32"},
+    # bf16 is opt-in (e.g. --model-override main.quantization_encoding=bfloat16);
+    # the executor currently applies it to the encoder (output re-cast to f32).
+    supported_encodings={"float32", "bfloat16"},
     example_repo_ids=[
         "openai/whisper-large-v3",
         "openai/whisper-large-v3-turbo",

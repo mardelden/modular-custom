@@ -54,6 +54,7 @@ from max.pipelines.lib.model_manifest import ModelManifest
 from max.pipelines.lib.pipeline_executor import PipelineExecutor
 from max.pipelines.lib.pipeline_runtime_config import PipelineRuntimeConfig
 from max.pipelines.modeling.base import TensorStruct
+from max.pipelines.modeling.config_enums import supported_encoding_dtype
 
 from .decoder import NEG_INF
 from .graph import (
@@ -202,15 +203,33 @@ class WhisperExecutor(
         self._device = load_devices(main.device_specs)[0]
         device_ref = DeviceRef.from_device(self._device)
 
-        # Weights -> encoder/decoder numpy state dicts (float32).
+        # Compute dtype: bf16 is opt-in via the model encoding; default f32.
+        # Staged bf16 rollout — this applies bf16 to the ENCODER only: it casts
+        # its output back to f32, so cross-KV / cached-decode / align stay f32
+        # and need no bf16 KV-cache buffers. (Decoder bf16 is the next step.)
+        encoding = getattr(main, "quantization_encoding", None) or "float32"
+        if encoding not in ("float32", "bfloat16"):
+            logger.warning(
+                "Whisper: unsupported encoding %r; falling back to float32.",
+                encoding,
+            )
+            encoding = "float32"
+        self._enc_dtype = supported_encoding_dtype(encoding)
+
+        # Weights -> encoder/decoder numpy state dicts (encoder may be bf16;
+        # decoder stays f32 for now).
         raw = load_raw_state_dict(model_dir)
-        enc_sd = rename_state_dict(raw, _rename_encoder_key)
+        enc_sd = rename_state_dict(
+            raw, _rename_encoder_key, dtype=self._enc_dtype
+        )
         dec_sd = rename_state_dict(raw, _rename_decoder_key)
 
         # Four compiled graphs on the injected session: encoder, cross-KV
         # precompute, unified KV-cached step graph, and teacher-forced align.
         self.encoder_model = session.load(
-            build_encoder_graph(enc_sd, self.config, DType.float32, device_ref),
+            build_encoder_graph(
+                enc_sd, self.config, self._enc_dtype, device_ref
+            ),
             weights_registry=enc_sd,
         )
         self.cross_kv_model = session.load(

@@ -68,18 +68,29 @@ def load_raw_state_dict(model_dir: str) -> dict[str, np.ndarray]:
 def rename_state_dict(
     raw: Mapping[str, np.ndarray],
     rename_fn: Callable[[str], str | None],
-) -> dict[str, np.ndarray]:
-    """Apply ``rename_fn`` to every key, dropping ``None`` results, casting f32.
+    dtype: DType = DType.float32,
+) -> dict[str, WeightData]:
+    """Apply ``rename_fn`` to every key, dropping ``None`` results, casting dtype.
 
     ``rename_fn`` is one of :func:`_rename_encoder_key` / :func:`_rename_decoder_key`
-    — it maps an HF key to its MAX FQN or returns ``None`` to drop it.
+    — it maps an HF key to its MAX FQN or returns ``None`` to drop it. ``dtype``
+    is the MAX compute dtype the target graph is built with (float32 by default;
+    ``bfloat16`` for the bf16 path).
+
+    Returns :class:`WeightData` (a ``DLPackArray`` accepted by both
+    ``load_state_dict`` and the ``session.load`` weights registry). We cast via
+    ``WeightData.astype`` rather than numpy so ``bfloat16`` works — this MAX
+    build has no numpy<->bf16 bridge, but ``WeightData.astype`` casts internally.
     """
-    out: dict[str, np.ndarray] = {}
+    out: dict[str, WeightData] = {}
     for key, arr in raw.items():
         name = rename_fn(key)
         if name is None:
             continue
-        out[name] = np.asarray(arr, dtype=np.float32)
+        wd = WeightData.from_numpy(np.ascontiguousarray(arr), name)
+        if wd.dtype != dtype:
+            wd = wd.astype(dtype)
+        out[name] = wd
     return out
 
 
