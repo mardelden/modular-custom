@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,6 +71,12 @@ from .weight_adapters import (
 )
 
 logger = logging.getLogger("max.pipelines")
+
+# Set MODULAR_WHISPER_PROFILE=1 to log a per-phase wall-time breakdown
+# (encode / decode / align / dtw) at INFO after every execute(). Each phase
+# ends in a host transfer (``.to_numpy()``), so the perf_counter deltas already
+# fold in the GPU work without an extra sync.
+_PROFILE = os.environ.get("MODULAR_WHISPER_PROFILE", "") not in ("", "0", "false")
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:
@@ -285,17 +292,23 @@ class WhisperExecutor(
         sot = meta[0].prompt_tokens or self._build_sot(meta[0].language)
         want_words = meta[0].word_timestamps
 
+        t = time.perf_counter()
         enc = (
             self.encoder_model.execute(inputs.mel)[0]
             .to_numpy()
             .astype(np.float32)
         )  # [B, 1500, d_model]
+        t_encode = time.perf_counter() - t
 
+        t = time.perf_counter()
         text_tokens, token_probs = self._decode_batch(enc, sot)
+        t_decode = time.perf_counter() - t
 
         texts: list[str] = []
         tokens_out: list[list[int]] = []
         words_out: list[list[TranscribedWord]] = []
+        t_align = 0.0
+        t_dtw = 0.0
         for b in range(batch):
             toks = text_tokens[b]
             texts.append(
@@ -304,7 +317,10 @@ class WhisperExecutor(
             tokens_out.append(toks)
             row_words: list[TranscribedWord] = []
             if want_words and toks:
+                t = time.perf_counter()
                 align_probs = self._alignment_probs(enc[b : b + 1], sot, toks)
+                t_align += time.perf_counter() - t
+                t = time.perf_counter()
                 for w in find_word_alignment(
                     align_probs,
                     toks,
@@ -322,7 +338,22 @@ class WhisperExecutor(
                             probability=prob if prob is not None else 0.0,
                         )
                     )
+                t_dtw += time.perf_counter() - t
             words_out.append(row_words)
+
+        if _PROFILE:
+            logger.info(
+                "WhisperExecutor timing (B=%d words=%s): "
+                "encode=%.1fms decode=%.1fms align=%.1fms dtw=%.1fms "
+                "total=%.1fms",
+                batch,
+                want_words,
+                t_encode * 1e3,
+                t_decode * 1e3,
+                t_align * 1e3,
+                t_dtw * 1e3,
+                (t_encode + t_decode + t_align + t_dtw) * 1e3,
+            )
 
         return WhisperExecResult(
             texts=texts,
