@@ -202,25 +202,30 @@ def find_word_alignment(
 
     matrix = w.mean(axis=0)  # [T_total, content_pos]
     # Rows for the transcript tokens, accounting for the causal-decoder shift:
-    # the cross-attention at sequence position p localizes the token being
-    # PREDICTED (seq[p+1]), not the input token seq[p]. So the row that
-    # localizes text_token[i] is one position earlier — the row where the model
-    # was predicting it. Slice one back to `[sot_len-1 : -2]` (row i -> text
-    # token i). Using `[sot_len:-1]` instead makes every timestamp ~one token
-    # (~240ms) late — verified against faster-whisper and HF.
-    matrix = matrix[sot_len - 1 : -2]
-    n_tok = matrix.shape[0]
-    if n_tok == 0:
+    # cross-attention at sequence position p localizes the token being PREDICTED
+    # (seq[p+1]), not the input seq[p]. So text_token[i] is localized one row
+    # earlier (the row where the model was predicting it). We keep rows
+    # `[sot_len-1 : -1]`:
+    #   * the first n rows localize the n text tokens (row i -> text_token[i]),
+    #   * the trailing row is the EOT boundary (the position predicting EOT); its
+    #     onset marks end-of-speech and bounds the LAST word's end, instead of
+    #     letting it run to end-of-content (trailing silence).
+    # Using `[sot_len:-1]` instead makes every timestamp ~one token (~240ms)
+    # late — verified against faster-whisper and HF.
+    matrix = matrix[sot_len - 1 : -1]
+    n_rows = matrix.shape[0]
+    if n_rows <= 1:
         return []
+    n_tok = n_rows - 1  # text tokens; the trailing row is the EOT boundary
 
     text_indices, time_indices = dtw(-matrix)
     jumps = np.pad(np.diff(text_indices), (1, 0), constant_values=1).astype(
         bool
     )
-    token_starts = time_indices[jumps] * TIME_PRECISION  # length n_tok
+    # length n_tok + 1: one onset per text token, plus the EOT-boundary onset.
+    token_starts = time_indices[jumps] * TIME_PRECISION
     audio_end = content_pos * TIME_PRECISION
 
-    # Only time as many tokens as we have alignment rows for.
     tokens = list(text_tokens[:n_tok])
     words, word_tokens = split_tokens_on_spaces(tokens, tokenizer)
     lengths = [len(t) for t in word_tokens]
@@ -231,9 +236,10 @@ def find_word_alignment(
         start_tok = int(boundaries[wi])
         end_tok = int(boundaries[wi + 1])
         start = float(token_starts[start_tok])
+        # end_tok tops out at n_tok, which indexes the EOT-boundary onset.
         end = (
             float(token_starts[end_tok])
-            if end_tok < n_tok
+            if end_tok < len(token_starts)
             else float(audio_end)
         )
         prob = (

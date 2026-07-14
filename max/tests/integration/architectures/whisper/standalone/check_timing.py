@@ -63,12 +63,14 @@ def check_alignment(model: str) -> None:
 
     # Peaks spread across the full frame range as broad Gaussian bumps (single-
     # frame spikes would be erased by the width-7 median filter, as check_median
-    # shows). Token i attends around frame f_i.
+    # shows). Token i attends around frame f_i. NOTE: because of the causal
+    # decoder shift, text_token[i] is localized at sequence position sot_len-1+i
+    # (the position predicting it), so place its peak there.
     xs = np.arange(content_pos)
     frames = [int((i + 1) / (n + 1) * content_pos) for i in range(n)]
     probs = np.full((n_heads, total, content_pos), 1e-4, dtype=np.float64)
     for i, f in enumerate(frames):
-        probs[:, sot_len + i, :] += np.exp(-0.5 * ((xs - f) / 6.0) ** 2)
+        probs[:, sot_len - 1 + i, :] += np.exp(-0.5 * ((xs - f) / 6.0) ** 2)
 
     words = find_word_alignment(
         probs,
