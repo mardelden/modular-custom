@@ -352,3 +352,131 @@ class WhisperTranscriber:
                 sot_len=len(self.sot),
             )
         return result
+
+    # ------------------------------------------------------------------ #
+    # v2 micro-batching: batch the (throughput-critical) decode loop; run
+    # per-clip alignment with the validated batch-1 align path.
+    # ------------------------------------------------------------------ #
+    def _greedy_decode_cached_batch(
+        self, enc: np.ndarray, max_new_tokens: int | None = None
+    ) -> tuple[list[list[int]], list[np.ndarray]]:
+        from max.driver import Buffer
+
+        cfg = self.config
+        batch = enc.shape[0]
+        n_layers = cfg.decoder_layers
+        n_heads = cfg.decoder_attention_heads
+        head_dim = cfg.d_model // n_heads
+        max_t = cfg.max_target_positions
+
+        cross_k, cross_v = self.cross_kv_model.execute(self._buf(enc))
+        zeros = np.zeros((batch, n_heads, max_t, head_dim), dtype=np.float32)
+        k_bufs = [
+            Buffer.from_numpy(zeros.copy()).to(self.device)
+            for _ in range(n_layers)
+        ]
+        v_bufs = [
+            Buffer.from_numpy(zeros.copy()).to(self.device)
+            for _ in range(n_layers)
+        ]
+
+        def run(
+            tokens_2d: np.ndarray, positions_2d: np.ndarray, cache_len: int
+        ):
+            t_new = tokens_2d.shape[1]
+            mask = self._cached_mask(cache_len, t_new, max_t)
+            clen = Buffer.from_numpy(np.array(cache_len, dtype=np.int64))
+            out = self.cached_model.execute(
+                self._buf(tokens_2d.astype(np.int32)),
+                self._buf(positions_2d.astype(np.int32)),
+                self._buf(mask),
+                clen,
+                cross_k,
+                cross_v,
+                *k_bufs,
+                *v_bufs,
+            )[0]
+            return out.to_numpy()[:, -1].astype(np.float64)  # [batch, vocab]
+
+        max_new = (
+            max_t if max_new_tokens is None else min(max_t, max_new_tokens)
+        )
+        text_tokens: list[list[int]] = [[] for _ in range(batch)]
+        token_probs: list[list[float]] = [[] for _ in range(batch)]
+        done = [False] * batch
+
+        # Prefill: every row feeds the same SOT prompt (lockstep).
+        sot = np.tile(np.array(self.sot, dtype=np.int32), (batch, 1))
+        pos = np.tile(np.arange(len(self.sot), dtype=np.int32), (batch, 1))
+        logits = run(sot, pos, 0)
+        cache_len = len(self.sot)
+        first = True
+        while cache_len < len(self.sot) + max_new and not all(done):
+            next_tokens = np.full(batch, self.eos_id, dtype=np.int32)
+            for b in range(batch):
+                if done[b]:
+                    continue
+                row = logits[b]
+                row[self.suppress_ids] = -np.inf
+                if first and self.begin_suppress_ids.size:
+                    row[self.begin_suppress_ids] = -np.inf
+                token_id = int(np.argmax(row))
+                if token_id == self.eos_id:
+                    done[b] = True
+                    continue
+                token_probs[b].append(float(_softmax(row)[token_id]))
+                text_tokens[b].append(token_id)
+                next_tokens[b] = token_id
+            first = False
+            if all(done):
+                break
+            # Finished rows keep feeding EOS so cache_len stays a single scalar.
+            logits = run(
+                next_tokens.reshape(batch, 1),
+                np.full((batch, 1), cache_len, dtype=np.int32),
+                cache_len,
+            )
+            cache_len += 1
+        return text_tokens, [np.array(p, dtype=np.float64) for p in token_probs]
+
+    def transcribe_batch(
+        self,
+        audio_paths: list[str],
+        word_timestamps: bool = True,
+        max_new_tokens: int | None = None,
+    ) -> list[dict]:
+        """Transcribe several ≤30s clips in one batched decode (KV cache only)."""
+        if not self.use_kv_cache:
+            raise RuntimeError("transcribe_batch requires use_kv_cache=True")
+        mels, content_frames = [], []
+        for path in audio_paths:
+            audio = load_audio(path)
+            if len(audio) / 16000.0 > 30.5:
+                raise ValueError(f"{path}: audio exceeds the 30s window")
+            mel, ncf = extract_features(audio, self.feature_extractor)
+            mels.append(mel[0])
+            content_frames.append(ncf)
+        mel_batch = np.stack(mels, axis=0)  # [B, n_mels, 3000]
+        enc = self.encoder_model.execute(self._buf(mel_batch))[0].to_numpy()
+        enc = enc.astype(np.float32)
+
+        text_tokens, token_probs = self._greedy_decode_cached_batch(
+            enc, max_new_tokens
+        )
+
+        results: list[dict] = []
+        for b, tokens in enumerate(text_tokens):
+            text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+            words: list[dict] = []
+            if word_timestamps and tokens:
+                align_probs = self._alignment_probs(enc[b : b + 1], tokens)
+                words = find_word_alignment(
+                    align_probs,
+                    tokens,
+                    self.tokenizer,
+                    content_frames[b],
+                    token_probs=token_probs[b],
+                    sot_len=len(self.sot),
+                )
+            results.append({"text": text, "words": words})
+        return results
