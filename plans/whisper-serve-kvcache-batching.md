@@ -1,24 +1,21 @@
 # Plan: Whisper v2 — KV-cached decode → micro-batching → `max serve`
 
-**Status:** In progress — A + B done & GPU-validated; C partially wired.
+**Status:** In progress — A + B + C done & GPU-validated on real hardware; D (deploy handoff) remains.
 **Date:** 2026-07-13
 **Branch:** `feat/whisper-word-ts` (worktree `modular-whisper`, continuing from v1 @ `0c7adadf13`)
 **Order (user-fixed):** (A) KV cache → (B) micro-batching → (C) max serve → (D) validation/deploy.
 
-## Progress / RESUME POINT (HEAD `049fe9aa58`)
+## Progress / RESUME POINT (HEAD `81c35cee63`)
 
 - **Phase A (KV cache)** — DONE, GPU-validated on large-v3: cached==no-cache, **2.33× decode speedup**. Commit `3095a00c11`.
 - **Phase B (micro-batching)** — DONE, GPU-validated: batch parity + **2.2× @ B=16**. Commit `177842363a`.
-- **Phase C (max serve)** — IN PROGRESS. Committed + import-verified so far: `PipelineTask.SPEECH_TO_TEXT`/`InputModality.AUDIO`, `SpeechToTextContext`, `SpeechToTextOutput`+`TranscribedWord`, `SpeechToTextInputs`, `SpeechToTextPipeline` (executor-path), all package exports (`20e48adf19`, `049fe9aa58`).
-- **REMAINING (build against the LIVE serve loop; box confirmed ready):**
-  1. **`WhisperExecutor`** (`architectures/whisper/executor.py`) — adapt `transcribe.py` (encoder + cross_kv + cached-decode loop + per-row align) into `PipelineExecutor[SpeechToTextContext, WhisperExecInputs(TensorStruct), Any]`; `supports_dynamic_batching=True`; returns a plain `WhisperExecResult(texts, tokens, words)`; builds graphs in `__init__` from `manifest["main"]` (factor the weight-load helpers out of `transcribe.py`).
-  2. **`WhisperServeTokenizer`** (`architectures/whisper/serve_tokenizer.py`) — `PipelineTokenizer`; `new_context(request)`: audio bytes → mel + `num_content_frames` + SOT prompt → `SpeechToTextContext`; ≤30.5s else `InputError`→400. Extend `audio.load_audio` to accept bytes/BytesIO.
-  3. **`arch.py` + `WhisperArchConfig`** (`get_max_seq_len()->448`) + lazy entry in `architectures/__init__.py` (`_LazyArch("WhisperForConditionalGeneration", ".whisper.arch", "whisper_arch")`).
-  4. **Registry** (`lib/registry.py`): `get_pipeline_for_task` SPEECH_TO_TEXT→`SpeechToTextPipeline`; early SPEECH_TO_TEXT branch in `retrieve_factory` (try full `resolve()`, fall back to `models.resolve()`).
-  5. **Serve plumbing**: `serve/scheduler/__init__.py` branch → `OneShotScheduler` w/ `batch_key=(language, word_timestamps)`; `serve/worker_interface/zmq_interface.py` response type; `serve/api_server.py` factory (`GeneralPipelineHandler`); **route** `POST /v1/audio/transcriptions` in `serve/router/openai_routes.py` (UploadFile+Form; verbose_json/json; InputError→400, cancelled→500).
-  6. **BUILD.bazel**: new `speech/BUILD.bazel` (no-mypy, ignore_unresolved_imports); add speech dep to `lib` + `serve/scheduler`; whisper BUILD += context/modeling.
-  7. **Boot** `max serve --model openai/whisper-large-v3 --devices gpu` on max-build (self-serve over ssh; scp in-progress files; **keep Klein down**, kill by port) and iterate on real tracebacks; then Phase D gates (serve_gate.sh + chunked_client_example.py).
-- **Env ready on box**: worktree `/opt/modular-whisper`, `/root/whisper-venv` (has serve stack + `python-multipart 0.0.32`), `HF_HOME=/mnt/models/huggingface`, `PYTHONPATH=/opt/modular-whisper/max/python`, cap `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE`. **NEXT = WhisperExecutor.**
+- **Phase C (max serve)** — **DONE, GPU-validated end-to-end on max-build (large-v3, sm_120).** Commits `20e48adf19`, `049fe9aa58` (type layer + pipeline), `15fdb89b4a` (WhisperExecutor), `415766990d` (arch + serve tokenizer + registry), `40b48c6bbc` (scheduler/zmq/api_server/route), `2190a2c25e` (BUILD.bazel), `81c35cee63` (executor batch-size log).
+  - **Gate C1** ✓ registry smoke: `retrieve_pipeline_task("WhisperForConditionalGeneration")`→SPEECH_TO_TEXT, lazy arch retrieval, pixel archs still import.
+  - **Gate C2** ✓ serve boots (`max serve --model openai/whisper-large-v3 --devices gpu --task speech_to_text`); `POST /v1/audio/transcriptions` returns exact transcript; served word timestamps **match the CLI KV reference** (`/root/max_words_kv.json`); `json` + `verbose_json` both work; >30s → **HTTP 400**.
+  - **Gate C3** ✓ 16-way concurrency flood: all-200; executor log shows **batch_size=1, 8, 7** (1+8+7=16) → dynamic batching confirmed. Wall 2667ms vs serial floor 4064ms.
+  - **Known-benign at boot:** full `pipeline_config.resolve(arch)` raises on the encoder-decoder "main" config (as predicted); the SPEECH_TO_TEXT branch logs a WARNING (with `exc_info` traceback) and falls back to `models.resolve()` — pipeline then boots fine. The logged traceback is expected, not a failure.
+- **Phase D (deploy handoff)** — REMAINING: `serve_gate.sh` (scripted C2/C3 + v1 regression), `chunked_client_example.py` (client-side long-audio chunking + concurrent posts + word-offset stitching = the fleet-integration demo), deploy-team handoff note (ship = repacked vendor wheel per the packaging lesson; branch `feat/whisper-word-ts`). bf16 is the named memory follow-up.
+- **Env ready on box**: worktree `/opt/modular-whisper` (now at `81c35cee63`), `/root/whisper-venv` (serve stack + `python-multipart`), `HF_HOME=/mnt/models/huggingface`, `PYTHONPATH=/opt/modular-whisper/max/python`, cap `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE=25769803776` (24GiB), `MODULAR_WHISPER_MAX_BATCH_SIZE=8`. **Boot/teardown loop:** setsid nohup the `max serve` cmd → `/tmp/whisper-serve.log`; teardown by `kill -TERM -<PGID>` of the `:8000` listener (never `pkill -f` over ssh). **Keep Klein down while serving.**
 
 ## Context
 
