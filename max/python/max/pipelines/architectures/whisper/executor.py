@@ -342,14 +342,21 @@ class WhisperExecutor(
             words_out.append(row_words)
 
         if _PROFILE:
+            split = getattr(self, "_decode_split", {"setup": 0.0, "device": 0.0})
+            d_setup = split["setup"] * 1e3
+            d_device = split["device"] * 1e3
+            d_host = t_decode * 1e3 - d_setup - d_device
             logger.info(
                 "WhisperExecutor timing (B=%d words=%s): "
-                "encode=%.1fms decode=%.1fms align=%.1fms dtw=%.1fms "
-                "total=%.1fms",
+                "encode=%.1fms decode=%.1fms [setup=%.1f dev=%.1f host=%.1f] "
+                "align=%.1fms dtw=%.1fms total=%.1fms",
                 batch,
                 want_words,
                 t_encode * 1e3,
                 t_decode * 1e3,
+                d_setup,
+                d_device,
+                d_host,
                 t_align * 1e3,
                 t_dtw * 1e3,
                 (t_encode + t_decode + t_align + t_dtw) * 1e3,
@@ -374,6 +381,7 @@ class WhisperExecutor(
         head_dim = cfg.d_model // n_heads
         max_t = cfg.max_target_positions
 
+        t_setup = time.perf_counter()
         cross_k, cross_v = self.cross_kv_model.execute(self._buf(enc))
         zeros = np.zeros((batch, n_heads, max_t, head_dim), dtype=np.float32)
         k_bufs = [
@@ -384,6 +392,7 @@ class WhisperExecutor(
             Buffer.from_numpy(zeros.copy()).to(self._device)
             for _ in range(n_layers)
         ]
+        split = {"setup": time.perf_counter() - t_setup, "device": 0.0}
 
         def run(
             tokens_2d: np.ndarray, positions_2d: np.ndarray, cache_len: int
@@ -391,6 +400,7 @@ class WhisperExecutor(
             t_new = tokens_2d.shape[1]
             mask = _cached_mask(cache_len, t_new, max_t)
             clen = Buffer.from_numpy(np.array(cache_len, dtype=np.int64))  # CPU
+            t_dev = time.perf_counter()
             out = self.cached_model.execute(
                 self._buf(tokens_2d.astype(np.int32)),
                 self._buf(positions_2d.astype(np.int32)),
@@ -401,7 +411,9 @@ class WhisperExecutor(
                 *k_bufs,
                 *v_bufs,
             )[0]
-            return out.to_numpy()[:, -1].astype(np.float64)  # [batch, vocab]
+            res = out.to_numpy()[:, -1].astype(np.float64)  # [batch, vocab]
+            split["device"] += time.perf_counter() - t_dev
+            return res
 
         max_new = max_t
         text_tokens: list[list[int]] = [[] for _ in range(batch)]
@@ -440,6 +452,7 @@ class WhisperExecutor(
                 cache_len,
             )
             cache_len += 1
+        self._decode_split = split
         return text_tokens, [
             np.array(p, dtype=np.float64) for p in token_probs
         ]
