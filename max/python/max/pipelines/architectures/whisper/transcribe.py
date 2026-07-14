@@ -33,7 +33,9 @@ import numpy as np
 from .audio import extract_features, load_audio
 from .decoder import NEG_INF
 from .graph import (
+    build_cross_kv_graph,
     build_decoder_align_graph,
+    build_decoder_cached_graph,
     build_decoder_generate_graph,
     build_encoder_graph,
 )
@@ -78,7 +80,11 @@ class WhisperTranscriber:
     """Load a Whisper checkpoint and transcribe a ≤30s clip with word timestamps."""
 
     def __init__(
-        self, model_id: str, device: str = "cpu", language: str = "en"
+        self,
+        model_id: str,
+        device: str = "cpu",
+        language: str = "en",
+        use_kv_cache: bool = True,
     ) -> None:
         from huggingface_hub import snapshot_download
         from max.driver import CPU, Accelerator, accelerator_count
@@ -138,16 +144,33 @@ class WhisperTranscriber:
         enc_sd = self._rename(raw, _rename_encoder_key)
         dec_sd = self._rename(raw, _rename_decoder_key)
 
+        self.use_kv_cache = use_kv_cache
         self.encoder_model = self.session.load(
             build_encoder_graph(enc_sd, self.config, DType.float32, device_ref),
             weights_registry=enc_sd,
         )
-        self.generate_model = self.session.load(
-            build_decoder_generate_graph(
-                dec_sd, self.config, DType.float32, device_ref
-            ),
-            weights_registry=dec_sd,
-        )
+        if use_kv_cache:
+            # v2: precompute cross-K/V once + a single cached step graph.
+            self.cross_kv_model = self.session.load(
+                build_cross_kv_graph(
+                    dec_sd, self.config, DType.float32, device_ref
+                ),
+                weights_registry=dec_sd,
+            )
+            self.cached_model = self.session.load(
+                build_decoder_cached_graph(
+                    dec_sd, self.config, DType.float32, device_ref
+                ),
+                weights_registry=dec_sd,
+            )
+        else:
+            # v1 path (kept for the parity cross-check): full-prefix recompute.
+            self.generate_model = self.session.load(
+                build_decoder_generate_graph(
+                    dec_sd, self.config, DType.float32, device_ref
+                ),
+                weights_registry=dec_sd,
+            )
         self.align_model = self.session.load(
             build_decoder_align_graph(
                 dec_sd,
@@ -206,6 +229,79 @@ class WhisperTranscriber:
         text_tokens = tokens[len(self.sot) :]
         return text_tokens, np.array(token_probs, dtype=np.float64)
 
+    @staticmethod
+    def _cached_mask(cache_len: int, t_new: int, max_t: int) -> np.ndarray:
+        """Additive mask ``[1,1,t_new,max_t]``: query row i (abs pos cache_len+i)
+        attends keys 0..cache_len+i; the unwritten cache tail is masked out."""
+        m = np.full((t_new, max_t), NEG_INF, dtype=np.float32)
+        for i in range(t_new):
+            m[i, : cache_len + i + 1] = 0.0
+        return m[None, None, :, :]
+
+    def _greedy_decode_cached(
+        self, enc: np.ndarray, max_new_tokens: int | None = None
+    ) -> tuple[list[int], np.ndarray]:
+        from max.driver import Buffer
+
+        cfg = self.config
+        n_layers = cfg.decoder_layers
+        n_heads = cfg.decoder_attention_heads
+        head_dim = cfg.d_model // n_heads
+        max_t = cfg.max_target_positions
+
+        # Precompute cross-K/V once; keep it + the caches device-resident.
+        cross_k, cross_v = self.cross_kv_model.execute(self._buf(enc))
+        zeros = np.zeros((1, n_heads, max_t, head_dim), dtype=np.float32)
+        k_bufs = [
+            Buffer.from_numpy(zeros.copy()).to(self.device)
+            for _ in range(n_layers)
+        ]
+        v_bufs = [
+            Buffer.from_numpy(zeros.copy()).to(self.device)
+            for _ in range(n_layers)
+        ]
+
+        def run(token_list: list[int], positions: list[int], cache_len: int):
+            t_new = len(token_list)
+            tok = np.array([token_list], dtype=np.int32)
+            pos = np.array([positions], dtype=np.int32)
+            mask = self._cached_mask(cache_len, t_new, max_t)
+            clen = Buffer.from_numpy(np.array(cache_len, dtype=np.int64))  # CPU
+            out = self.cached_model.execute(
+                self._buf(tok),
+                self._buf(pos),
+                self._buf(mask),
+                clen,
+                cross_k,
+                cross_v,
+                *k_bufs,
+                *v_bufs,
+            )[0]
+            return out.to_numpy()[0, -1].astype(np.float64)  # [vocab]
+
+        max_new = (
+            max_t if max_new_tokens is None else min(max_t, max_new_tokens)
+        )
+        text_tokens: list[int] = []
+        token_probs: list[float] = []
+        # Prefill the SOT prompt (positions 0..len(sot)-1).
+        logits = run(self.sot, list(range(len(self.sot))), 0)
+        cache_len = len(self.sot)
+        first = True
+        while len(text_tokens) < max_new:
+            logits[self.suppress_ids] = -np.inf
+            if first and self.begin_suppress_ids.size:
+                logits[self.begin_suppress_ids] = -np.inf
+            first = False
+            token_id = int(np.argmax(logits))
+            if token_id == self.eos_id:
+                break
+            token_probs.append(float(_softmax(logits)[token_id]))
+            text_tokens.append(token_id)
+            logits = run([token_id], [cache_len], cache_len)
+            cache_len += 1
+        return text_tokens, np.array(token_probs, dtype=np.float64)
+
     def _alignment_probs(
         self, enc: np.ndarray, text_tokens: list[int]
     ) -> np.ndarray:
@@ -236,7 +332,12 @@ class WhisperTranscriber:
             audio, self.feature_extractor
         )
         enc = self._encode(mel)
-        text_tokens, token_probs = self._greedy_decode(enc, max_new_tokens)
+        if self.use_kv_cache:
+            text_tokens, token_probs = self._greedy_decode_cached(
+                enc, max_new_tokens
+            )
+        else:
+            text_tokens, token_probs = self._greedy_decode(enc, max_new_tokens)
         text = self.tokenizer.decode(text_tokens, skip_special_tokens=True)
 
         result: dict = {"text": text, "words": []}
